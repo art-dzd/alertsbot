@@ -1,0 +1,14 @@
+[Unit]
+Description=alertsbot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/alertsbot
+EnvironmentFile=/alertsbot/.env
+ExecStart=/alertsbot/.venv/bin/uvicorn alertsbot.app:app --host ${ALERTS_APP_HOST} --port ${ALERTS_APP_PORT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
