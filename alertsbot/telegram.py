@@ -20,12 +20,9 @@ async def send_message(
         "text": text,
         "disable_web_page_preview": True,
     }
-    client_kwargs: dict[str, object] = {"timeout": timeout}
+    client_kwargs: dict[str, object] = {"timeout": timeout, "trust_env": False}
     if proxy_url:
-        client_kwargs["proxies"] = {
-            "http://": proxy_url,
-            "https://": proxy_url,
-        }
+        client_kwargs["proxy"] = proxy_url
     async with httpx.AsyncClient(**client_kwargs) as client:
         response = await client.post(url, json=payload)
         response.raise_for_status()
