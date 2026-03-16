@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     alerts_bot_token: str = Field(default="", alias="ALERTS_BOT_TOKEN")
     alerts_chat_id: str = Field(default="", alias="ALERTS_CHAT_ID")
     alerts_token: str = Field(default="", alias="ALERTS_TOKEN")
+    telegram_proxy_url: str = Field(default="", alias="TELEGRAM_PROXY_URL")
     app_host: str = Field(default="0.0.0.0", alias="ALERTS_APP_HOST")
     app_port: int = Field(default=9100, alias="ALERTS_APP_PORT")
     log_level: str = Field(default="INFO", alias="ALERTS_LOG_LEVEL")

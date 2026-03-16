@@ -53,6 +53,7 @@ async def notify(
             settings.alerts_chat_id,
             text,
             settings.request_timeout_seconds,
+            settings.telegram_proxy_url,
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to send Telegram message")

@@ -13,6 +13,12 @@ cp .env.example .env
 uvicorn alertsbot.app:app --host 0.0.0.0 --port 9100
 ```
 
+Если Telegram недоступен напрямую (блокировки/ограничения), можно указать прокси для Telegram API:
+
+```bash
+TELEGRAM_PROXY_URL=http://127.0.0.1:7890
+```
+
 ## Эндпоинты
 
 - `GET /healthz` — health‑check.
