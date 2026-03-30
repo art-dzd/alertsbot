@@ -1,7 +1,11 @@
 # Деплой alertsbot
 
+## Способ деплоя
+
+Ручной деплой через `scripts/restart.sh` + systemd. CI/CD-пайплайнов, Docker-контейнеров и миграций БД нет — проект stateless.
+
 ## Что нужно заранее
-- Linux-хост с `systemd` и доступом в интернет к Telegram API.
+- Linux-хост с `systemd` и доступом в интернет к Telegram API (или настроенный `TELEGRAM_PROXY_URL`).
 - Python 3.11+ и `python3-venv`.
 - Заполненный `.env` на основе `.env.example`.
 

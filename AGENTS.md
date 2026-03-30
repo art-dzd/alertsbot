@@ -23,11 +23,23 @@
 5. Простота и прозрачность важнее усложнений (очередей/ретраев внутри сервиса нет).
 
 ## Каноническая документация
-- `docs/architecture.md` — компоненты, границы системы, поток `/notify`.
+
+### Основная
+- `docs/architecture.md` — компоненты, стек, модули, data flow, конфигурация, запуск.
 - `docs/deploy.md` — запуск, systemd-деплой, post-check и rollback.
 - `docs/testing.md` — текущий quality gate и smoke-сценарии.
 - `docs/commands.md` — рабочие команды разработки и эксплуатации.
 - `docs/design/notify-flow.md` — контракт запроса и инварианты форматирования.
+
+### Ревью и аудиты
+- `docs/quality-score.md` — сводная оценка проекта (5/10) и топ-5 приоритетных действий.
+- `docs/code-review.md` — code review: баги, error handling, race conditions (оценка 7.5/10).
+- `docs/architecture-review.md` — архитектурная оценка по 7 критериям (оценка 7.3/10).
+- `docs/security-review.md` — security audit: OWASP Top 10, CVE, auth, валидация.
+- `docs/dependency-audit.md` — аудит зависимостей: версии, CVE, пиннинг, устаревание.
+- `docs/ci-review.md` — ревью CI/CD: текущее состояние и дорожная карта.
+- `docs/test-gaps.md` — анализ тестового покрытия и приоритетный план написания тестов.
+- `docs/simplifier-report.md` — что можно упростить: мёртвый код, дублирование, комментарии.
 
 ## Ограничения
 - Без валидного `ALERTS_TOKEN` отправка запрещена.

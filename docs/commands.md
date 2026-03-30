@@ -43,3 +43,7 @@ systemctl restart alertsbot
 ```bash
 python -m compileall alertsbot
 ```
+
+## Lint / Build
+
+В проекте нет линтера, форматтера или этапа сборки. Минимальный quality gate — `python -m compileall alertsbot` (см. выше).
