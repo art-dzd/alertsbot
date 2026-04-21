@@ -20,8 +20,16 @@ class NotifyRequest(BaseModel):
     details: str | None = Field(default=None, description="Дополнительные детали")
 
 
-app = FastAPI(title="alertsbot")
 settings = get_settings()
+docs_url = None if settings.is_production else "/docs"
+redoc_url = None if settings.is_production else "/redoc"
+openapi_url = None if settings.is_production else "/openapi.json"
+app = FastAPI(
+    title="alertsbot",
+    docs_url=docs_url,
+    redoc_url=redoc_url,
+    openapi_url=openapi_url,
+)
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger("alertsbot")
 
@@ -55,8 +63,8 @@ async def notify(
             settings.request_timeout_seconds,
             settings.telegram_proxy_url,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001
         logger.exception("Failed to send Telegram message")
-        raise HTTPException(status_code=502, detail="Telegram error")
+        raise HTTPException(status_code=502, detail="Telegram error") from error
 
     return {"status": "sent"}

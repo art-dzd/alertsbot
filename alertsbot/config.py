@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    alerts_env: str = Field(default="dev", alias="ALERTS_ENV")
     alerts_bot_token: str = Field(default="", alias="ALERTS_BOT_TOKEN")
     alerts_chat_id: str = Field(default="", alias="ALERTS_CHAT_ID")
     alerts_token: str = Field(default="", alias="ALERTS_TOKEN")
@@ -24,6 +25,12 @@ class Settings(BaseSettings):
         default=10.0,
         alias="ALERTS_REQUEST_TIMEOUT_SECONDS",
     )
+
+    @property
+    def is_production(self) -> bool:
+        """Возвращает true для production-окружения."""
+
+        return self.alerts_env.strip().lower() in {"prod", "production"}
 
 
 @lru_cache
