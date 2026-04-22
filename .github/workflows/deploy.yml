@@ -19,13 +19,17 @@ jobs:
       - name: Deploy to mts over SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ secrets.MTS_SSH_HOST }}
-          username: ${{ secrets.MTS_SSH_USER }}
-          key: ${{ secrets.MTS_SSH_KEY }}
-          port: ${{ secrets.MTS_SSH_PORT || '1997' }}
+          host: ${{ secrets.ALERTSBOT_HOST }}
+          username: ${{ secrets.ALERTSBOT_USER }}
+          key: ${{ secrets.ALERTSBOT_SSH_KEY }}
+          port: ${{ secrets.ALERTSBOT_PORT || '1997' }}
           script: |
             set -euo pipefail
-            cd /alertsbot
+            ALERTS_DIR="${{ secrets.ALERTSBOT_DIR }}"
+            if [ -z "$ALERTS_DIR" ]; then
+              ALERTS_DIR=/alertsbot
+            fi
+            cd "$ALERTS_DIR"
             sudo -u alertsbot git fetch --prune origin main
             sudo -u alertsbot git reset --hard ${{ github.event.workflow_run.head_sha }}
             sudo -u alertsbot .venv/bin/pip install -r requirements.txt
