@@ -35,7 +35,8 @@ logger = logging.getLogger("alertsbot")
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, str]:
+@app.get("/health")
+async def health() -> dict[str, str]:
     """Проверка доступности сервиса."""
 
     return {"status": "ok"}

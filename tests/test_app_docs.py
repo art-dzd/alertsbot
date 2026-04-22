@@ -37,6 +37,15 @@ def test_openapi_docs_are_enabled_outside_prod(monkeypatch: MonkeyPatch) -> None
 def test_health_endpoint_stays_available_in_prod(monkeypatch: MonkeyPatch) -> None:
     client = TestClient(load_app_with_env(monkeypatch, "production"))
 
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_healthz_endpoint_stays_available_in_prod(monkeypatch: MonkeyPatch) -> None:
+    client = TestClient(load_app_with_env(monkeypatch, "production"))
+
     response = client.get("/healthz")
 
     assert response.status_code == 200

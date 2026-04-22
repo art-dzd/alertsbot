@@ -1,0 +1,41 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: ["main"]
+    types: [completed]
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to mts over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.MTS_SSH_HOST }}
+          username: ${{ secrets.MTS_SSH_USER }}
+          key: ${{ secrets.MTS_SSH_KEY }}
+          port: ${{ secrets.MTS_SSH_PORT || '1997' }}
+          script: |
+            set -euo pipefail
+            cd /alertsbot
+            sudo -u alertsbot git fetch --prune origin main
+            sudo -u alertsbot git reset --hard ${{ github.event.workflow_run.head_sha }}
+            sudo -u alertsbot .venv/bin/pip install -r requirements.txt
+            sudo systemctl daemon-reload
+            sudo systemctl restart alertsbot
+            for attempt in $(seq 1 10); do
+              if curl -fsS http://127.0.0.1:9100/health; then
+                exit 0
+              fi
+              sleep 2
+            done
+            sudo journalctl -u alertsbot --since "2 minutes ago" --no-pager
+            exit 1
