@@ -31,6 +31,8 @@ app = FastAPI(
     openapi_url=openapi_url,
 )
 logging.basicConfig(level=settings.log_level)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("alertsbot")
 
 
