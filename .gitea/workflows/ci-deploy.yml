@@ -1,0 +1,127 @@
+name: CI and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  SOURCE_DIR: /home/ai/gitea-src/alertsbot
+  DEPLOY_DIR: /alertsbot
+  TARGET_SHA: ${{ github.sha }}
+  CI_VENV: /home/ai/.cache/alertsbot-ci-venv
+  HEALTH_URL: http://127.0.0.1:9100/healthz
+
+jobs:
+  ci:
+    runs-on: deploy-mts
+    timeout-minutes: 15
+    steps:
+      - name: Sync source
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TARGET_SHA:-}" ]; then
+            echo "Cannot determine TARGET_SHA" >&2
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$SOURCE_DIR")"
+          if [ ! -d "$SOURCE_DIR/.git" ]; then
+            git clone ssh://git@gitea.aiomc.ru:2222/admin/alertsbot.git "$SOURCE_DIR"
+          fi
+
+          cd "$SOURCE_DIR"
+          git remote set-url origin ssh://git@gitea.aiomc.ru:2222/admin/alertsbot.git
+          git fetch origin main --tags --prune
+          git reset --hard "$TARGET_SHA"
+          git clean -ffdx
+
+      - name: Install CI dependencies
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          if [ ! -x "$CI_VENV/bin/python" ]; then
+            python3 -m venv "$CI_VENV"
+          fi
+          "$CI_VENV/bin/python" -m pip install --upgrade pip
+          "$CI_VENV/bin/python" -m pip install -r requirements-dev.txt
+
+      - name: Ruff
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          "$CI_VENV/bin/python" -m ruff check .
+
+      - name: Pytest
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          "$CI_VENV/bin/python" -m pytest -q --tb=short
+
+  deploy:
+    runs-on: deploy-mts
+    needs: [ci]
+    timeout-minutes: 10
+    steps:
+      - name: Deploy alertsbot
+        run: |
+          set -euo pipefail
+          export DEPLOY_DIR TARGET_SHA HEALTH_URL
+
+          /usr/bin/flock -w 600 /tmp/alertsbot-gitea-deploy.lock /bin/bash <<'DEPLOY'
+          set -euo pipefail
+
+          if [ -z "${TARGET_SHA:-}" ]; then
+            echo "Cannot determine TARGET_SHA" >&2
+            exit 1
+          fi
+
+          if [ ! -d "$DEPLOY_DIR/.git" ]; then
+            echo "Deploy directory is not a git clone: $DEPLOY_DIR" >&2
+            exit 1
+          fi
+
+          wait_health() {
+            for attempt in $(seq 1 10); do
+              if curl -fsS "$HEALTH_URL"; then
+                echo
+                return 0
+              fi
+              echo "health attempt ${attempt}/10 failed"
+              sleep 2
+            done
+            return 1
+          }
+
+          cd "$DEPLOY_DIR"
+          PREVIOUS_SHA="$(sudo -u alertsbot git rev-parse HEAD)"
+
+          rollback() {
+            local failed_line="$1"
+            echo "Deploy failed at line ${failed_line}; rolling back to ${PREVIOUS_SHA}" >&2
+            sudo -u alertsbot git reset --hard "$PREVIOUS_SHA" || true
+            sudo -u alertsbot .venv/bin/pip install -r requirements.txt || true
+            sudo systemctl daemon-reload || true
+            sudo systemctl restart alertsbot || true
+            wait_health || true
+          }
+
+          trap 'rollback $LINENO' ERR
+
+          sudo -u alertsbot git fetch origin main --tags --prune
+          sudo -u alertsbot git reset --hard "$TARGET_SHA"
+          sudo -u alertsbot .venv/bin/pip install -r requirements.txt
+          sudo systemctl daemon-reload
+          sudo systemctl restart alertsbot
+          wait_health
+          sudo systemctl is-active --quiet alertsbot
+
+          trap - ERR
+          DEPLOY
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          sudo systemctl status alertsbot --no-pager -l || true
+          sudo journalctl -u alertsbot --since "5 minutes ago" --no-pager || true
