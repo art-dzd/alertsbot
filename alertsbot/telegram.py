@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 
 logger = logging.getLogger(__name__)
+_FINAL_PROXY_ATTEMPTS = 2
 
 _unhealthy_proxy_until: dict[str, float] = {}
 
@@ -106,24 +107,34 @@ async def send_message(
     last_retryable_error: Exception | None = None
     candidates = _ordered_proxy_urls(proxy_urls)
 
-    for proxy_url in candidates:
-        try:
-            await _send_message_once(token, chat_id, text, timeout, proxy_url)
-        except Exception as error:
-            if not _is_retryable_error(error):
-                raise
+    for proxy_index, proxy_url in enumerate(candidates):
+        attempts = _FINAL_PROXY_ATTEMPTS if proxy_index == len(candidates) - 1 else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                await _send_message_once(token, chat_id, text, timeout, proxy_url)
+            except Exception as error:
+                if not _is_retryable_error(error):
+                    raise
 
-            last_retryable_error = error
-            _mark_proxy_unhealthy(proxy_url, circuit_breaker_seconds)
-            logger.warning(
-                "Telegram send failed via %s: %s",
-                describe_proxy(proxy_url),
-                error,
-            )
-            continue
+                last_retryable_error = error
+                if attempt < attempts:
+                    logger.warning(
+                        "Telegram send failed via %s, retrying final proxy: %s",
+                        describe_proxy(proxy_url),
+                        error,
+                    )
+                    continue
 
-        _mark_proxy_healthy(proxy_url)
-        return proxy_url
+                _mark_proxy_unhealthy(proxy_url, circuit_breaker_seconds)
+                logger.warning(
+                    "Telegram send failed via %s: %s",
+                    describe_proxy(proxy_url),
+                    error,
+                )
+                continue
+
+            _mark_proxy_healthy(proxy_url)
+            return proxy_url
 
     if last_retryable_error:
         raise last_retryable_error

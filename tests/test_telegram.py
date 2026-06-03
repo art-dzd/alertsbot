@@ -84,6 +84,22 @@ def test_send_message_falls_back_after_connect_error(monkeypatch: MonkeyPatch) -
     assert FakeAsyncClient.calls == ["http://primary:8888", "http://reserve:8888"]
 
 
+def test_send_message_retries_final_proxy_once(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(
+        monkeypatch,
+        [httpx.ConnectError("primary down"), httpx.ConnectError("reserve blip"), 200],
+    )
+
+    used_proxy = send_for_test(("http://primary:8888", "http://reserve:8888"))
+
+    assert used_proxy == "http://reserve:8888"
+    assert FakeAsyncClient.calls == [
+        "http://primary:8888",
+        "http://reserve:8888",
+        "http://reserve:8888",
+    ]
+
+
 def test_send_message_uses_circuit_breaker_after_failure(monkeypatch: MonkeyPatch) -> None:
     setup_fake_client(monkeypatch, [httpx.ConnectError("primary down"), 200])
     send_for_test(("http://primary:8888", "http://reserve:8888"))
