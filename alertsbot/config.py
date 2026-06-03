@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     alerts_chat_id: str = Field(default="", alias="ALERTS_CHAT_ID")
     alerts_token: str = Field(default="", alias="ALERTS_TOKEN")
     telegram_proxy_url: str = Field(default="", alias="TELEGRAM_PROXY_URL")
+    telegram_proxy_urls: str = Field(default="", alias="TELEGRAM_PROXY_URLS")
+    telegram_proxy_circuit_breaker_seconds: float = Field(
+        default=120.0,
+        alias="TELEGRAM_PROXY_CIRCUIT_BREAKER_SECONDS",
+    )
     app_host: str = Field(default="0.0.0.0", alias="ALERTS_APP_HOST")
     app_port: int = Field(default=9100, alias="ALERTS_APP_PORT")
     log_level: str = Field(default="INFO", alias="ALERTS_LOG_LEVEL")
@@ -31,6 +36,24 @@ class Settings(BaseSettings):
         """Возвращает true для production-окружения."""
 
         return self.alerts_env.strip().lower() in {"prod", "production"}
+
+    @property
+    def telegram_proxy_sequence(self) -> tuple[str, ...]:
+        """Возвращает список Telegram proxy с обратной совместимостью."""
+
+        proxy_urls = tuple(
+            proxy_url.strip()
+            for proxy_url in self.telegram_proxy_urls.split(",")
+            if proxy_url.strip()
+        )
+        if proxy_urls:
+            return proxy_urls
+
+        proxy_url = self.telegram_proxy_url.strip()
+        if proxy_url:
+            return (proxy_url,)
+
+        return ("",)
 
 
 @lru_cache

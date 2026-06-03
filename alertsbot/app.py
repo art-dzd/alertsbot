@@ -8,7 +8,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from alertsbot.config import get_settings
-from alertsbot.telegram import send_message
+from alertsbot.telegram import describe_proxy, send_message
 
 
 class NotifyRequest(BaseModel):
@@ -59,15 +59,17 @@ async def notify(
         text = f"{text}\n\n{payload.details}"
 
     try:
-        await send_message(
+        proxy_url = await send_message(
             settings.alerts_bot_token,
             settings.alerts_chat_id,
             text,
             settings.request_timeout_seconds,
-            settings.telegram_proxy_url,
+            settings.telegram_proxy_sequence,
+            settings.telegram_proxy_circuit_breaker_seconds,
         )
     except Exception as error:  # noqa: BLE001
         logger.exception("Failed to send Telegram message")
         raise HTTPException(status_code=502, detail="Telegram error") from error
 
+    logger.info("Telegram alert sent via %s", describe_proxy(proxy_url))
     return {"status": "sent"}
