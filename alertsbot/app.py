@@ -9,7 +9,13 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from alertsbot.config import get_settings
-from alertsbot.telegram import describe_proxy, describe_telegram_error, send_message
+from alertsbot.telegram import (
+    TelegramPayloadError,
+    TelegramPermanentError,
+    describe_proxy,
+    describe_telegram_error,
+    send_message,
+)
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 TRUNCATION_NOTICE = "\n\n[сообщение усечено до лимита Telegram]"
@@ -112,9 +118,15 @@ async def notify(
             settings.telegram_proxy_sequence,
             settings.telegram_proxy_circuit_breaker_seconds,
         )
+    except TelegramPayloadError as error:
+        logger.error("Telegram rejected payload: %s", describe_telegram_error(error))
+        raise HTTPException(status_code=422, detail="Telegram payload rejected") from error
+    except TelegramPermanentError as error:
+        logger.error("Permanent Telegram error: %s", describe_telegram_error(error))
+        raise HTTPException(status_code=424, detail="Permanent Telegram error") from error
     except Exception as error:  # noqa: BLE001
-        logger.error("Failed to send Telegram message: %s", describe_telegram_error(error))
-        raise HTTPException(status_code=502, detail="Telegram error") from error
+        logger.error("Temporary Telegram error: %s", describe_telegram_error(error))
+        raise HTTPException(status_code=502, detail="Temporary Telegram error") from error
 
     logger.info("Telegram alert sent via %s", describe_proxy(proxy_url))
     return {"status": "sent"}

@@ -10,11 +10,28 @@ from pytest import LogCaptureFixture, MonkeyPatch, raises
 from alertsbot import telegram
 from alertsbot.config import Settings
 
+FakeOutcome = Exception | int | tuple[int, dict[str, Any]]
+
 
 class FakeResponse:
-    def __init__(self, status_code: int, url: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        url: str,
+        json_data: dict[str, Any] | None = None,
+    ) -> None:
         request = httpx.Request("POST", url)
-        self.response = httpx.Response(status_code, request=request)
+        if json_data is None:
+            self.response = httpx.Response(status_code, request=request)
+        else:
+            self.response = httpx.Response(status_code, request=request, json=json_data)
+
+    @property
+    def status_code(self) -> int:
+        return self.response.status_code
+
+    def json(self) -> Any:
+        return self.response.json()
 
     def raise_for_status(self) -> None:
         self.response.raise_for_status()
@@ -22,7 +39,7 @@ class FakeResponse:
 
 class FakeAsyncClient:
     calls: list[str] = []
-    outcomes: list[Exception | int] = []
+    outcomes: list[FakeOutcome] = []
 
     def __init__(
         self,
@@ -47,10 +64,14 @@ class FakeAsyncClient:
         if isinstance(outcome, Exception):
             raise outcome
 
+        if isinstance(outcome, tuple):
+            status_code, json_data = outcome
+            return FakeResponse(status_code, url, json_data)
+
         return FakeResponse(outcome, url)
 
 
-def setup_fake_client(monkeypatch: MonkeyPatch, outcomes: list[Exception | int]) -> None:
+def setup_fake_client(monkeypatch: MonkeyPatch, outcomes: list[FakeOutcome]) -> None:
     telegram.reset_proxy_circuit_breakers()
     FakeAsyncClient.calls = []
     FakeAsyncClient.outcomes = outcomes
@@ -113,10 +134,19 @@ def test_send_message_uses_circuit_breaker_after_failure(monkeypatch: MonkeyPatc
     assert FakeAsyncClient.calls == ["http://reserve:8888"]
 
 
-def test_send_message_does_not_retry_telegram_4xx(monkeypatch: MonkeyPatch) -> None:
-    setup_fake_client(monkeypatch, [401])
+def test_send_message_does_not_retry_payload_error(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [400])
 
-    with raises(httpx.HTTPStatusError):
+    with raises(telegram.TelegramPayloadError):
+        send_for_test(("http://primary:8888", "http://reserve:8888"))
+
+    assert FakeAsyncClient.calls == ["http://primary:8888"]
+
+
+def test_send_message_does_not_retry_permanent_error(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [403])
+
+    with raises(telegram.TelegramPermanentError):
         send_for_test(("http://primary:8888", "http://reserve:8888"))
 
     assert FakeAsyncClient.calls == ["http://primary:8888"]
@@ -129,6 +159,44 @@ def test_send_message_retries_5xx(monkeypatch: MonkeyPatch) -> None:
 
     assert used_proxy == "http://reserve:8888"
     assert FakeAsyncClient.calls == ["http://primary:8888", "http://reserve:8888"]
+
+
+def test_send_message_retries_429_after_bounded_retry_after(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [(429, {"parameters": {"retry_after": 30}}), 200])
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("alertsbot.telegram.asyncio.sleep", record_sleep)
+
+    used_proxy = send_for_test(("http://primary:8888",))
+
+    assert used_proxy == "http://primary:8888"
+    assert FakeAsyncClient.calls == ["http://primary:8888", "http://primary:8888"]
+    assert sleeps == [1.0]
+
+
+def test_send_message_tries_unhealthy_proxy_as_last_resort(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [httpx.ConnectError("primary down"), 200])
+    telegram._mark_proxy_unhealthy("http://reserve:8888", 60.0)
+
+    used_proxy = send_for_test(("http://primary:8888", "http://reserve:8888"))
+
+    assert used_proxy == "http://reserve:8888"
+    assert FakeAsyncClient.calls == ["http://primary:8888", "http://reserve:8888"]
+
+
+def test_send_message_does_not_ban_proxy_after_telegram_5xx(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [502, 200])
+    send_for_test(("http://primary:8888", "http://reserve:8888"))
+
+    FakeAsyncClient.calls = []
+    FakeAsyncClient.outcomes = [200]
+    used_proxy = send_for_test(("http://primary:8888", "http://reserve:8888"))
+
+    assert used_proxy == "http://primary:8888"
+    assert FakeAsyncClient.calls == ["http://primary:8888"]
 
 
 def test_send_message_logs_http_status_without_bot_token(

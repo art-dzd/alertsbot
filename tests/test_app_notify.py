@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pytest import LogCaptureFixture, MonkeyPatch
 
 from alertsbot.config import get_settings
+from alertsbot.telegram import TelegramPayloadError, TelegramPermanentError
 
 
 def load_notify_app(monkeypatch: MonkeyPatch) -> tuple[Any, TestClient]:
@@ -191,3 +192,53 @@ def test_notify_logs_http_status_without_bot_token(
     assert response.status_code == 502
     assert secret_token not in caplog.text
     assert "HTTPStatusError status=502" in caplog.text
+
+
+def test_notify_maps_telegram_payload_error_to_422(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+
+    async def fail_send(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+    ) -> str:
+        raise TelegramPayloadError("bad request", status_code=400)
+
+    monkeypatch.setattr(app_module, "send_message", fail_send)
+
+    response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload(),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Telegram payload rejected"}
+
+
+def test_notify_maps_telegram_permanent_error_to_424(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+
+    async def fail_send(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+    ) -> str:
+        raise TelegramPermanentError("forbidden", status_code=403)
+
+    monkeypatch.setattr(app_module, "send_message", fail_send)
+
+    response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload(),
+    )
+
+    assert response.status_code == 424
+    assert response.json() == {"detail": "Permanent Telegram error"}
