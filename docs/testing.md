@@ -1,15 +1,18 @@
 # Тестирование alertsbot
 
 ## Текущее состояние
-Автоматические unit/integration тесты в репозитории отсутствуют.
-Минимальный quality gate сейчас строится на проверке импорта, запуска и smoke-тестах API.
+В репозитории есть unit-тесты FastAPI-слоя и Telegram-клиента.
+Quality gate: `pytest`, `ruff`, `mypy`.
 
 ## Локальные проверки перед деплоем
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-python -m compileall alertsbot
+pip install -r requirements-dev.txt
+pytest -q --tb=short
+ruff check .
+mypy alertsbot tests
 ```
 
 Проверка, что приложение поднимается:
@@ -38,11 +41,12 @@ curl -i -X POST http://127.0.0.1:9100/notify \
 ## Критерии готовности к релизу
 - Приложение стартует без traceback.
 - `/healthz` отвечает успешно.
-- `/notify` корректно разделяет `401` и `200/502` сценарии.
+- `/notify` корректно разделяет `200`, `401`, `422`, `424`, `502`.
+- Telegram `429` ретраится один раз с ограниченной паузой.
+- Telegram `400` не ретраится и маппится в `422`.
+- Telegram `401/403/404` не ретраятся и маппятся в `424`.
 - В `journalctl` нет новых необработанных исключений.
 
 ## Долг по качеству
-Рекомендуется добавить автотесты на:
-- авторизацию заголовка `X-Alerts-Token`;
-- форматирование текста уведомления;
-- маппинг ошибок Telegram в `HTTP 502`.
+- Добавить идемпотентность по `event_id` с TTL.
+- Добавить post-restart healthcheck в `scripts/restart.sh`.

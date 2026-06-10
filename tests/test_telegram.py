@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 import httpx
+import pytest
 from pytest import LogCaptureFixture, MonkeyPatch, raises
 
 from alertsbot import telegram
@@ -143,8 +144,12 @@ def test_send_message_does_not_retry_payload_error(monkeypatch: MonkeyPatch) -> 
     assert FakeAsyncClient.calls == ["http://primary:8888"]
 
 
-def test_send_message_does_not_retry_permanent_error(monkeypatch: MonkeyPatch) -> None:
-    setup_fake_client(monkeypatch, [403])
+@pytest.mark.parametrize("status_code", [401, 403, 404])
+def test_send_message_does_not_retry_permanent_error(
+    monkeypatch: MonkeyPatch,
+    status_code: int,
+) -> None:
+    setup_fake_client(monkeypatch, [status_code])
 
     with raises(telegram.TelegramPermanentError):
         send_for_test(("http://primary:8888", "http://reserve:8888"))
@@ -175,6 +180,44 @@ def test_send_message_retries_429_after_bounded_retry_after(monkeypatch: MonkeyP
     assert used_proxy == "http://primary:8888"
     assert FakeAsyncClient.calls == ["http://primary:8888", "http://primary:8888"]
     assert sleeps == [1.0]
+
+
+def test_send_message_raises_429_after_retry_is_exhausted(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(
+        monkeypatch,
+        [
+            (429, {"parameters": {"retry_after": 30}}),
+            (429, {"parameters": {"retry_after": 30}}),
+        ],
+    )
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("alertsbot.telegram.asyncio.sleep", record_sleep)
+
+    with raises(telegram.TelegramRateLimitError):
+        send_for_test(("http://primary:8888",))
+
+    assert FakeAsyncClient.calls == ["http://primary:8888", "http://primary:8888"]
+    assert sleeps == [1.0]
+
+
+def test_send_message_ignores_non_numeric_retry_after(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [(429, {"parameters": {"retry_after": "5"}}), 200])
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("alertsbot.telegram.asyncio.sleep", record_sleep)
+
+    used_proxy = send_for_test(("http://primary:8888",))
+
+    assert used_proxy == "http://primary:8888"
+    assert FakeAsyncClient.calls == ["http://primary:8888", "http://primary:8888"]
+    assert sleeps == []
 
 
 def test_send_message_tries_unhealthy_proxy_as_last_resort(monkeypatch: MonkeyPatch) -> None:

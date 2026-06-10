@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from pytest import LogCaptureFixture, MonkeyPatch
 
 from alertsbot.config import get_settings
-from alertsbot.telegram import TelegramPayloadError, TelegramPermanentError
+from alertsbot.telegram import TelegramPayloadError, TelegramPermanentError, TelegramRateLimitError
 
 
 def load_notify_app(monkeypatch: MonkeyPatch) -> tuple[Any, TestClient]:
@@ -242,3 +242,32 @@ def test_notify_maps_telegram_permanent_error_to_424(monkeypatch: MonkeyPatch) -
 
     assert response.status_code == 424
     assert response.json() == {"detail": "Permanent Telegram error"}
+
+
+def test_notify_maps_exhausted_telegram_rate_limit_to_502(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+
+    async def fail_send(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+    ) -> str:
+        raise TelegramRateLimitError(
+            "rate limit",
+            status_code=429,
+            retry_after_seconds=30.0,
+        )
+
+    monkeypatch.setattr(app_module, "send_message", fail_send)
+
+    response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload(),
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Temporary Telegram error"}

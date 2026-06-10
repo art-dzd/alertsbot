@@ -28,9 +28,12 @@ trace_id=abc123
 ## Ответ API
 - Успех: `200` + `{ "status": "sent" }`.
 - Ошибка авторизации: `401` + `{"detail":"Unauthorized"}`.
-- Ошибка Telegram: `502` + `{"detail":"Telegram error"}`.
+- Telegram отклонил payload: `422` + `{"detail":"Telegram payload rejected"}`.
+- Постоянная ошибка Telegram-доступа/конфига: `424` + `{"detail":"Permanent Telegram error"}`.
+- Временная ошибка Telegram: `502` + `{"detail":"Temporary Telegram error"}`.
 
 ## Важные инварианты
 - Без валидного `X-Alerts-Token` отправка в Telegram невозможна.
-- Сервис не меняет содержимое полей, кроме склейки строк.
-- В случае исключения из Telegram клиенту всегда отдаётся `502`.
+- Сервис склеивает поля в текст и усекает итоговое сообщение до лимита Telegram.
+- `429` от Telegram ретраится один раз с ограниченной паузой по `retry_after`.
+- `400` считается ошибкой payload, `401/403/404` — постоянной ошибкой доступа/конфига.
