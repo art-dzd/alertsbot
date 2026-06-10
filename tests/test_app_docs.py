@@ -13,6 +13,9 @@ from alertsbot.config import get_settings
 
 def load_app_with_env(monkeypatch: MonkeyPatch, alerts_env: str) -> FastAPI:
     monkeypatch.setenv("ALERTS_ENV", alerts_env)
+    monkeypatch.setenv("ALERTS_BOT_TOKEN", "123456:bot-token")
+    monkeypatch.setenv("ALERTS_CHAT_ID", "-100")
+    monkeypatch.setenv("ALERTS_TOKEN", "shared-secret")
     get_settings.cache_clear()
     sys.modules.pop("alertsbot.app", None)
     return cast(FastAPI, importlib.import_module("alertsbot.app").app)
@@ -50,3 +53,12 @@ def test_healthz_endpoint_stays_available_in_prod(monkeypatch: MonkeyPatch) -> N
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_readyz_endpoint_reports_ready_with_valid_config(monkeypatch: MonkeyPatch) -> None:
+    client = TestClient(load_app_with_env(monkeypatch, "production"))
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}

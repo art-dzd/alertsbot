@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_PLACEHOLDER_VALUES = {"", "replace_me", "replace-me", "changeme", "change_me"}
+
+
+def _is_placeholder(value: str) -> bool:
+    return value.strip().lower() in _PLACEHOLDER_VALUES
 
 
 class Settings(BaseSettings):
@@ -54,6 +60,28 @@ class Settings(BaseSettings):
             return (proxy_url,)
 
         return ("",)
+
+    @model_validator(mode="after")
+    def validate_runtime_settings(self) -> Settings:
+        self._validate_timing()
+        if self.is_production:
+            self._validate_prod_secret("ALERTS_BOT_TOKEN", self.alerts_bot_token)
+            self._validate_prod_secret("ALERTS_CHAT_ID", self.alerts_chat_id)
+            self._validate_prod_secret("ALERTS_TOKEN", self.alerts_token)
+
+        return self
+
+    def _validate_timing(self) -> None:
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("ALERTS_REQUEST_TIMEOUT_SECONDS must be greater than 0")
+
+        if self.telegram_proxy_circuit_breaker_seconds < 0:
+            raise ValueError("TELEGRAM_PROXY_CIRCUIT_BREAKER_SECONDS must be 0 or greater")
+
+    @staticmethod
+    def _validate_prod_secret(name: str, value: str) -> None:
+        if _is_placeholder(value):
+            raise ValueError(f"{name} must be set in production")
 
 
 @lru_cache

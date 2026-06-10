@@ -19,6 +19,7 @@ mypy alertsbot tests
 ```bash
 uvicorn alertsbot.app:app --host 127.0.0.1 --port 9100
 curl -fsS http://127.0.0.1:9100/healthz
+curl -fsS http://127.0.0.1:9100/readyz
 ```
 
 ## Smoke-тест `/notify`
@@ -41,6 +42,7 @@ curl -i -X POST http://127.0.0.1:9100/notify \
 ## Критерии готовности к релизу
 - Приложение стартует без traceback.
 - `/healthz` отвечает успешно.
+- `/readyz` отвечает успешно при валидном конфиге.
 - `/notify` корректно разделяет `200`, `401`, `422`, `424`, `502`.
 - Telegram `429` ретраится один раз с ограниченной паузой.
 - Telegram `400` не ретраится и маппится в `422`.

@@ -60,6 +60,7 @@
 | Метод  | Путь       | Авторизация       | Описание                        |
 |--------|------------|-------------------|---------------------------------|
 | `GET`  | `/healthz` | нет               | Liveness-проверка. Возвращает `{"status":"ok"}`. |
+| `GET`  | `/readyz`  | нет               | Readiness-проверка валидного runtime-конфига. |
 | `POST` | `/notify`  | `X-Alerts-Token`  | Приём уведомления и отправка в Telegram. |
 
 ### POST /notify — контракт
@@ -136,6 +137,9 @@
 | `ALERTS_REQUEST_TIMEOUT_SECONDS` | `10.0`       | Timeout исходящего запроса в Telegram (сек)  |
 | `TELEGRAM_PROXY_URL`             | `""`         | HTTP/SOCKS-прокси для Telegram API (опционально) |
 
+В `prod`/`production` окружении сервис падает при старте, если `ALERTS_BOT_TOKEN`, `ALERTS_CHAT_ID` или `ALERTS_TOKEN` пустые либо равны placeholder-значениям вроде `replace_me`.
+`ALERTS_REQUEST_TIMEOUT_SECONDS` должен быть больше `0`, `TELEGRAM_PROXY_CIRCUIT_BREAKER_SECONDS` — не меньше `0`.
+
 ## Запуск
 
 ### Локально (dev)
@@ -171,4 +175,5 @@ bash scripts/restart.sh
 - Очереди нет: при долгой недоступности Telegram клиент получает `502`.
 - `429` ретраится один раз с паузой по `retry_after`, но пауза жёстко ограничена.
 - Proxy breaker банит только транспортные ошибки/таймауты; Telegram `5xx` не помечает proxy нездоровым.
+- `/healthz` показывает живость процесса, `/readyz` — готовность конфигурации после fail-fast валидации.
 - Docker не используется — только systemd.

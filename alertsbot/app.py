@@ -97,6 +97,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/readyz")
+async def ready() -> dict[str, str]:
+    return {"status": "ready"}
+
+
 @app.post("/notify")
 async def notify(
     payload: NotifyRequest,
