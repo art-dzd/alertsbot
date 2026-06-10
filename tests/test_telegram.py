@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import httpx
-from pytest import MonkeyPatch, raises
+from pytest import LogCaptureFixture, MonkeyPatch, raises
 
 from alertsbot import telegram
 from alertsbot.config import Settings
 
 
 class FakeResponse:
-    def __init__(self, status_code: int) -> None:
-        request = httpx.Request("POST", "https://api.telegram.org/bot-token/sendMessage")
+    def __init__(self, status_code: int, url: str) -> None:
+        request = httpx.Request("POST", url)
         self.response = httpx.Response(status_code, request=request)
 
     def raise_for_status(self) -> None:
@@ -46,7 +47,7 @@ class FakeAsyncClient:
         if isinstance(outcome, Exception):
             raise outcome
 
-        return FakeResponse(outcome)
+        return FakeResponse(outcome, url)
 
 
 def setup_fake_client(monkeypatch: MonkeyPatch, outcomes: list[Exception | int]) -> None:
@@ -56,8 +57,8 @@ def setup_fake_client(monkeypatch: MonkeyPatch, outcomes: list[Exception | int])
     monkeypatch.setattr("alertsbot.telegram.httpx.AsyncClient", FakeAsyncClient)
 
 
-def send_for_test(proxy_urls: tuple[str, ...]) -> str:
-    return asyncio.run(telegram.send_message("token", "chat", "text", 1.0, proxy_urls, 60.0))
+def send_for_test(proxy_urls: tuple[str, ...], token: str = "token") -> str:
+    return asyncio.run(telegram.send_message(token, "chat", "text", 1.0, proxy_urls, 60.0))
 
 
 def test_settings_prefers_proxy_url_list() -> None:
@@ -128,3 +129,18 @@ def test_send_message_retries_5xx(monkeypatch: MonkeyPatch) -> None:
 
     assert used_proxy == "http://reserve:8888"
     assert FakeAsyncClient.calls == ["http://primary:8888", "http://reserve:8888"]
+
+
+def test_send_message_logs_http_status_without_bot_token(
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+) -> None:
+    secret_token = "123456:VERY_SECRET_TOKEN"
+    setup_fake_client(monkeypatch, [502, 502])
+
+    with caplog.at_level(logging.WARNING, logger="alertsbot.telegram"):
+        with raises(httpx.HTTPStatusError):
+            send_for_test(("http://primary:8888",), token=secret_token)
+
+    assert secret_token not in caplog.text
+    assert "HTTPStatusError status=502" in caplog.text

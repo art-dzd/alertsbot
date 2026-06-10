@@ -35,6 +35,13 @@ def describe_proxy(proxy_url: str) -> str:
     return f"{parsed.scheme}://{parsed.hostname}{port}"
 
 
+def describe_telegram_error(error: Exception) -> str:
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"{type(error).__name__} status={error.response.status_code}"
+
+    return type(error).__name__
+
+
 def _ordered_proxy_urls(proxy_urls: Sequence[str]) -> tuple[str, ...]:
     candidates = tuple(dict.fromkeys(proxy_url.strip() for proxy_url in proxy_urls)) or ("",)
     now = time.monotonic()
@@ -121,7 +128,7 @@ async def send_message(
                     logger.warning(
                         "Telegram send failed via %s, retrying final proxy: %s",
                         describe_proxy(proxy_url),
-                        error,
+                        describe_telegram_error(error),
                     )
                     continue
 
@@ -129,7 +136,7 @@ async def send_message(
                 logger.warning(
                     "Telegram send failed via %s: %s",
                     describe_proxy(proxy_url),
-                    error,
+                    describe_telegram_error(error),
                 )
                 continue
 
