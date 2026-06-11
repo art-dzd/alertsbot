@@ -271,3 +271,168 @@ def test_notify_maps_exhausted_telegram_rate_limit_to_502(monkeypatch: MonkeyPat
 
     assert response.status_code == 502
     assert response.json() == {"detail": "Temporary Telegram error"}
+
+
+def test_notify_reuses_event_id_without_duplicate_send(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+    sent_messages: list[str] = []
+
+    async def record_message(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        sent_messages.append(text)
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", record_message)
+    payload = sample_payload() | {"event_id": "event-1"}
+
+    first_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+    second_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert sent_messages == ["billing\nошибка\nупало"]
+
+
+def test_notify_without_event_id_keeps_sending_each_request(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+    sent_messages: list[str] = []
+
+    async def record_message(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        sent_messages.append(text)
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", record_message)
+
+    client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload(),
+    )
+    client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload(),
+    )
+
+    assert sent_messages == ["billing\nошибка\nупало", "billing\nошибка\nупало"]
+
+
+def test_notify_forgets_event_id_after_ttl(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+    sent_messages: list[str] = []
+    now = 1000.0
+
+    def monotonic() -> float:
+        return now
+
+    async def record_message(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        sent_messages.append(text)
+        return ""
+
+    monkeypatch.setattr(app_module.time, "monotonic", monotonic)
+    monkeypatch.setattr(app_module, "send_message", record_message)
+    payload = sample_payload() | {"event_id": "event-ttl"}
+
+    client.post("/notify", headers={"X-Alerts-Token": "shared-secret"}, json=payload)
+    client.post("/notify", headers={"X-Alerts-Token": "shared-secret"}, json=payload)
+    now += app_module.IDEMPOTENCY_TTL_SECONDS + 1
+    client.post("/notify", headers={"X-Alerts-Token": "shared-secret"}, json=payload)
+
+    assert sent_messages == ["billing\nошибка\nупало", "billing\nошибка\nупало"]
+
+
+def test_notify_replays_event_id_error_without_duplicate_send(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+    send_calls = 0
+
+    async def fail_send(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        nonlocal send_calls
+        send_calls += 1
+        raise TelegramPermanentError("forbidden", status_code=403)
+
+    monkeypatch.setattr(app_module, "send_message", fail_send)
+    payload = sample_payload() | {"event_id": "event-error"}
+
+    first_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+    second_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+
+    assert first_response.status_code == 424
+    assert second_response.status_code == 424
+    assert send_calls == 1
+
+
+def test_notify_passes_lifespan_client_pool_to_sender(monkeypatch: MonkeyPatch) -> None:
+    app_module, unused_client = load_notify_app(monkeypatch)
+    captured_pools: list[object] = []
+
+    async def record_message(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        captured_pools.append(kwargs["client_pool"])
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", record_message)
+
+    with TestClient(app_module.app) as client:
+        response = client.post(
+            "/notify",
+            headers={"X-Alerts-Token": "shared-secret"},
+            json=sample_payload(),
+        )
+
+    unused_client.close()
+    assert response.status_code == 200
+    assert captured_pools

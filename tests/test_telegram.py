@@ -41,6 +41,7 @@ class FakeResponse:
 class FakeAsyncClient:
     calls: list[str] = []
     outcomes: list[FakeOutcome] = []
+    created_proxies: list[str] = []
 
     def __init__(
         self,
@@ -48,15 +49,20 @@ class FakeAsyncClient:
         timeout: float,
         trust_env: bool,
         proxy: str = "",
+        limits: object | None = None,
     ) -> None:
         self.proxy = proxy
         self.timeout = timeout
         self.trust_env = trust_env
+        self.created_proxies.append(proxy)
 
     async def __aenter__(self) -> FakeAsyncClient:
         return self
 
     async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def aclose(self) -> None:
         return None
 
     async def post(self, url: str, json: dict[str, Any]) -> FakeResponse:
@@ -75,12 +81,27 @@ class FakeAsyncClient:
 def setup_fake_client(monkeypatch: MonkeyPatch, outcomes: list[FakeOutcome]) -> None:
     telegram.reset_proxy_circuit_breakers()
     FakeAsyncClient.calls = []
+    FakeAsyncClient.created_proxies = []
     FakeAsyncClient.outcomes = outcomes
     monkeypatch.setattr("alertsbot.telegram.httpx.AsyncClient", FakeAsyncClient)
 
 
-def send_for_test(proxy_urls: tuple[str, ...], token: str = "token") -> str:
-    return asyncio.run(telegram.send_message(token, "chat", "text", 1.0, proxy_urls, 60.0))
+def send_for_test(
+    proxy_urls: tuple[str, ...],
+    token: str = "token",
+    client_pool: telegram.TelegramClientPool | None = None,
+) -> str:
+    return asyncio.run(
+        telegram.send_message(
+            token,
+            "chat",
+            "text",
+            1.0,
+            proxy_urls,
+            60.0,
+            client_pool=client_pool,
+        ),
+    )
 
 
 def test_settings_prefers_proxy_url_list() -> None:
@@ -240,6 +261,23 @@ def test_send_message_does_not_ban_proxy_after_telegram_5xx(monkeypatch: MonkeyP
 
     assert used_proxy == "http://primary:8888"
     assert FakeAsyncClient.calls == ["http://primary:8888"]
+
+
+def test_send_message_client_pool_keeps_proxy_fallback(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [httpx.ConnectError("primary down"), 200])
+    client_pool = telegram.TelegramClientPool(timeout=1.0)
+
+    try:
+        used_proxy = send_for_test(
+            ("http://primary:8888", "http://reserve:8888"),
+            client_pool=client_pool,
+        )
+    finally:
+        asyncio.run(client_pool.aclose())
+
+    assert used_proxy == "http://reserve:8888"
+    assert FakeAsyncClient.calls == ["http://primary:8888", "http://reserve:8888"]
+    assert FakeAsyncClient.created_proxies == ["http://primary:8888", "http://reserve:8888"]
 
 
 def test_send_message_logs_http_status_without_bot_token(

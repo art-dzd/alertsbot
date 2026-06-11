@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from alertsbot.config import get_settings
 from alertsbot.telegram import (
+    TelegramClientPool,
     TelegramPayloadError,
     TelegramPermanentError,
     describe_proxy,
@@ -23,6 +29,20 @@ SERVICE_MAX_LENGTH = 128
 TITLE_MAX_LENGTH = 256
 MESSAGE_MAX_LENGTH = 4096
 DETAILS_MAX_LENGTH = 8192
+EVENT_ID_MAX_LENGTH = 128
+IDEMPOTENCY_TTL_SECONDS = 3600.0
+
+
+@dataclass(frozen=True, slots=True)
+class NotifyResult:
+    status_code: int
+    body: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class IdempotencyRecord:
+    result: NotifyResult
+    expires_at: float
 
 
 class NotifyRequest(BaseModel):
@@ -48,17 +68,39 @@ class NotifyRequest(BaseModel):
         max_length=DETAILS_MAX_LENGTH,
         description="Дополнительные детали",
     )
+    event_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=EVENT_ID_MAX_LENGTH,
+        description="Идемпотентный идентификатор события",
+    )
 
 
 settings = get_settings()
 docs_url = None if settings.is_production else "/docs"
 redoc_url = None if settings.is_production else "/redoc"
 openapi_url = None if settings.is_production else "/openapi.json"
+
+_idempotency_records: dict[str, IdempotencyRecord] = {}
+_idempotency_locks: dict[str, asyncio.Lock] = {}
+_idempotency_index_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
+    fastapi_app.state.telegram_client_pool = TelegramClientPool(settings.request_timeout_seconds)
+    try:
+        yield
+    finally:
+        await fastapi_app.state.telegram_client_pool.aclose()
+
+
 app = FastAPI(
     title="alertsbot",
     docs_url=docs_url,
     redoc_url=redoc_url,
     openapi_url=openapi_url,
+    lifespan=lifespan,
 )
 logging.basicConfig(level=settings.log_level)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -89,6 +131,124 @@ def format_alert(payload: NotifyRequest) -> str:
     return _fit_telegram_message_limit(text)
 
 
+def _telegram_client_pool() -> TelegramClientPool | None:
+    return getattr(app.state, "telegram_client_pool", None)
+
+
+def _prune_expired_idempotency_records(now: float) -> None:
+    expired_event_ids = [
+        event_id
+        for event_id, record in _idempotency_records.items()
+        if record.expires_at <= now
+    ]
+    for event_id in expired_event_ids:
+        _idempotency_records.pop(event_id, None)
+        lock = _idempotency_locks.get(event_id)
+        if lock is not None and not lock.locked():
+            _idempotency_locks.pop(event_id, None)
+
+
+async def _event_lock(event_id: str) -> asyncio.Lock:
+    async with _idempotency_index_lock:
+        _prune_expired_idempotency_records(time.monotonic())
+        lock = _idempotency_locks.get(event_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _idempotency_locks[event_id] = lock
+
+        return lock
+
+
+def _cached_notify_result(event_id: str) -> NotifyResult | None:
+    now = time.monotonic()
+    _prune_expired_idempotency_records(now)
+    record = _idempotency_records.get(event_id)
+    if record is None:
+        return None
+
+    if record.expires_at <= now:
+        _idempotency_records.pop(event_id, None)
+        return None
+
+    return record.result
+
+
+def _remember_notify_result(event_id: str, result: NotifyResult) -> None:
+    _idempotency_records[event_id] = IdempotencyRecord(
+        result=result,
+        expires_at=time.monotonic() + IDEMPOTENCY_TTL_SECONDS,
+    )
+
+
+def _replay_notify_result(result: NotifyResult) -> dict[str, str]:
+    if result.status_code >= 400:
+        raise HTTPException(status_code=result.status_code, detail=result.body["detail"])
+
+    return dict(result.body)
+
+
+def _exception_result(error: HTTPException) -> NotifyResult:
+    return NotifyResult(
+        status_code=error.status_code,
+        body={"detail": str(error.detail)},
+    )
+
+
+async def _send_notify(payload: NotifyRequest) -> dict[str, str]:
+    text = format_alert(payload)
+
+    send_kwargs = {}
+    telegram_client_pool = _telegram_client_pool()
+    if telegram_client_pool is not None:
+        send_kwargs["client_pool"] = telegram_client_pool
+
+    try:
+        proxy_url = await send_message(
+            settings.alerts_bot_token,
+            settings.alerts_chat_id,
+            text,
+            settings.request_timeout_seconds,
+            settings.telegram_proxy_sequence,
+            settings.telegram_proxy_circuit_breaker_seconds,
+            **send_kwargs,
+        )
+    except TelegramPayloadError as error:
+        logger.error("Telegram rejected payload: %s", describe_telegram_error(error))
+        raise HTTPException(status_code=422, detail="Telegram payload rejected") from error
+    except TelegramPermanentError as error:
+        logger.error("Permanent Telegram error: %s", describe_telegram_error(error))
+        raise HTTPException(status_code=424, detail="Permanent Telegram error") from error
+    except Exception as error:  # noqa: BLE001
+        logger.error("Temporary Telegram error: %s", describe_telegram_error(error))
+        raise HTTPException(status_code=502, detail="Temporary Telegram error") from error
+
+    logger.info("Telegram alert sent via %s", describe_proxy(proxy_url))
+    return {"status": "sent"}
+
+
+async def _send_notify_once_per_event(payload: NotifyRequest) -> dict[str, str]:
+    if payload.event_id is None:
+        return await _send_notify(payload)
+
+    lock = await _event_lock(payload.event_id)
+    async with lock:
+        cached_result = _cached_notify_result(payload.event_id)
+        if cached_result is not None:
+            return _replay_notify_result(cached_result)
+
+        try:
+            result_body = await _send_notify(payload)
+        except HTTPException as error:
+            _remember_notify_result(payload.event_id, _exception_result(error))
+            raise
+
+        _remember_notify_result(
+            payload.event_id,
+            NotifyResult(status_code=200, body=result_body),
+        )
+        return result_body
+
+
 @app.get("/healthz")
 @app.get("/health")
 async def health() -> dict[str, str]:
@@ -112,26 +272,4 @@ async def notify(
     if not _is_authorized(x_alerts_token):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    text = format_alert(payload)
-
-    try:
-        proxy_url = await send_message(
-            settings.alerts_bot_token,
-            settings.alerts_chat_id,
-            text,
-            settings.request_timeout_seconds,
-            settings.telegram_proxy_sequence,
-            settings.telegram_proxy_circuit_breaker_seconds,
-        )
-    except TelegramPayloadError as error:
-        logger.error("Telegram rejected payload: %s", describe_telegram_error(error))
-        raise HTTPException(status_code=422, detail="Telegram payload rejected") from error
-    except TelegramPermanentError as error:
-        logger.error("Permanent Telegram error: %s", describe_telegram_error(error))
-        raise HTTPException(status_code=424, detail="Permanent Telegram error") from error
-    except Exception as error:  # noqa: BLE001
-        logger.error("Temporary Telegram error: %s", describe_telegram_error(error))
-        raise HTTPException(status_code=502, detail="Temporary Telegram error") from error
-
-    logger.info("Telegram alert sent via %s", describe_proxy(proxy_url))
-    return {"status": "sent"}
+    return await _send_notify_once_per_event(payload)

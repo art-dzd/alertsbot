@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 _FINAL_PROXY_ATTEMPTS = 2
 _RATE_LIMIT_RETRY_ATTEMPTS = 1
 _MAX_RATE_LIMIT_SLEEP_SECONDS = 1.0
+_MAX_CONNECTIONS = 20
+_MAX_KEEPALIVE_CONNECTIONS = 10
 
 _unhealthy_proxy_until: dict[str, float] = {}
 
@@ -42,6 +44,31 @@ class TelegramPermanentError(TelegramError):
 
 class TelegramRateLimitError(TelegramError):
     pass
+
+
+class TelegramClientPool:
+    def __init__(self, timeout: float) -> None:
+        self._timeout = timeout
+        self._limits = httpx.Limits(
+            max_connections=_MAX_CONNECTIONS,
+            max_keepalive_connections=_MAX_KEEPALIVE_CONNECTIONS,
+        )
+        self._clients: dict[str, httpx.AsyncClient] = {}
+
+    def client_for(self, proxy_url: str) -> httpx.AsyncClient:
+        normalized_proxy_url = proxy_url.strip()
+        client = self._clients.get(normalized_proxy_url)
+        if client is None:
+            client = _create_client(self._timeout, normalized_proxy_url, self._limits)
+            self._clients[normalized_proxy_url] = client
+
+        return client
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            await client.aclose()
+
+        self._clients.clear()
 
 
 def reset_proxy_circuit_breakers() -> None:
@@ -169,19 +196,26 @@ def _raise_for_telegram_status(response: httpx.Response) -> None:
         raise
 
 
-def _create_client(timeout: float, proxy_url: str) -> httpx.AsyncClient:
+def _create_client(
+    timeout: float,
+    proxy_url: str,
+    limits: httpx.Limits | None = None,
+) -> httpx.AsyncClient:
+    client_kwargs: dict[str, Any] = {"timeout": timeout, "trust_env": False}
+    if limits is not None:
+        client_kwargs["limits"] = limits
     if proxy_url:
-        return httpx.AsyncClient(timeout=timeout, trust_env=False, proxy=proxy_url)
+        client_kwargs["proxy"] = proxy_url
 
-    return httpx.AsyncClient(timeout=timeout, trust_env=False)
+    return httpx.AsyncClient(**client_kwargs)
 
 
 async def _send_message_once(
     token: str,
     chat_id: str,
     text: str,
-    timeout: float,
     proxy_url: str,
+    client_pool: TelegramClientPool,
 ) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -190,9 +224,9 @@ async def _send_message_once(
         "disable_web_page_preview": True,
     }
 
-    async with _create_client(timeout, proxy_url) as client:
-        response = await client.post(url, json=payload)
-        _raise_for_telegram_status(response)
+    client = client_pool.client_for(proxy_url)
+    response = await client.post(url, json=payload)
+    _raise_for_telegram_status(response)
 
 
 async def send_message(
@@ -202,60 +236,67 @@ async def send_message(
     timeout: float,
     proxy_urls: Sequence[str],
     circuit_breaker_seconds: float,
+    client_pool: TelegramClientPool | None = None,
 ) -> str:
     """Отправляет сообщение в Telegram, перебирая proxy при сетевых сбоях."""
 
     last_retryable_error: Exception | None = None
     candidates = _ordered_proxy_urls(proxy_urls)
     rate_limit_retries_left = _RATE_LIMIT_RETRY_ATTEMPTS
+    owns_client_pool = client_pool is None
+    telegram_client_pool = client_pool or TelegramClientPool(timeout)
 
-    for proxy_index, proxy_url in enumerate(candidates):
-        attempts = _FINAL_PROXY_ATTEMPTS if proxy_index == len(candidates) - 1 else 1
-        attempt = 1
-        while attempt <= attempts:
-            try:
-                await _send_message_once(token, chat_id, text, timeout, proxy_url)
-            except TelegramRateLimitError as error:
-                last_retryable_error = error
-                if rate_limit_retries_left <= 0:
-                    raise
+    try:
+        for proxy_index, proxy_url in enumerate(candidates):
+            attempts = _FINAL_PROXY_ATTEMPTS if proxy_index == len(candidates) - 1 else 1
+            attempt = 1
+            while attempt <= attempts:
+                try:
+                    await _send_message_once(token, chat_id, text, proxy_url, telegram_client_pool)
+                except TelegramRateLimitError as error:
+                    last_retryable_error = error
+                    if rate_limit_retries_left <= 0:
+                        raise
 
-                rate_limit_retries_left -= 1
-                sleep_seconds = _bounded_rate_limit_sleep_seconds(error.retry_after_seconds)
-                logger.warning(
-                    "Telegram rate limited via %s, retrying after %.2fs: %s",
-                    describe_proxy(proxy_url),
-                    sleep_seconds,
-                    describe_telegram_error(error),
-                )
-                if sleep_seconds > 0:
-                    await asyncio.sleep(sleep_seconds)
-                continue
-            except Exception as error:
-                if not _is_retryable_error(error):
-                    raise
-
-                last_retryable_error = error
-                if attempt < attempts:
-                    attempt += 1
+                    rate_limit_retries_left -= 1
+                    sleep_seconds = _bounded_rate_limit_sleep_seconds(error.retry_after_seconds)
                     logger.warning(
-                        "Telegram send failed via %s, retrying final proxy: %s",
+                        "Telegram rate limited via %s, retrying after %.2fs: %s",
+                        describe_proxy(proxy_url),
+                        sleep_seconds,
+                        describe_telegram_error(error),
+                    )
+                    if sleep_seconds > 0:
+                        await asyncio.sleep(sleep_seconds)
+                    continue
+                except Exception as error:
+                    if not _is_retryable_error(error):
+                        raise
+
+                    last_retryable_error = error
+                    if attempt < attempts:
+                        attempt += 1
+                        logger.warning(
+                            "Telegram send failed via %s, retrying final proxy: %s",
+                            describe_proxy(proxy_url),
+                            describe_telegram_error(error),
+                        )
+                        continue
+
+                    if _should_mark_proxy_unhealthy(error):
+                        _mark_proxy_unhealthy(proxy_url, circuit_breaker_seconds)
+                    logger.warning(
+                        "Telegram send failed via %s: %s",
                         describe_proxy(proxy_url),
                         describe_telegram_error(error),
                     )
-                    continue
+                    break
 
-                if _should_mark_proxy_unhealthy(error):
-                    _mark_proxy_unhealthy(proxy_url, circuit_breaker_seconds)
-                logger.warning(
-                    "Telegram send failed via %s: %s",
-                    describe_proxy(proxy_url),
-                    describe_telegram_error(error),
-                )
-                break
-
-            _mark_proxy_healthy(proxy_url)
-            return proxy_url
+                _mark_proxy_healthy(proxy_url)
+                return proxy_url
+    finally:
+        if owns_client_pool:
+            await telegram_client_pool.aclose()
 
     if last_retryable_error:
         raise last_retryable_error
