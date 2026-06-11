@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import sys
@@ -306,6 +307,62 @@ def test_notify_reuses_event_id_without_duplicate_send(monkeypatch: MonkeyPatch)
     assert first_response.status_code == 200
     assert second_response.status_code == 200
     assert sent_messages == ["billing\nошибка\nупало"]
+
+
+def test_notify_concurrent_event_id_posts_send_once(monkeypatch: MonkeyPatch) -> None:
+    app_module, unused_client = load_notify_app(monkeypatch)
+    send_calls = 0
+
+    async def run_race() -> list[int]:
+        nonlocal send_calls
+        first_send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def record_message(
+            token: str,
+            chat_id: str,
+            text: str,
+            timeout: float,
+            proxy_urls: Sequence[str],
+            circuit_breaker_seconds: float,
+            **kwargs: object,
+        ) -> str:
+            nonlocal send_calls
+            send_calls += 1
+            first_send_started.set()
+            await release_send.wait()
+            return ""
+
+        monkeypatch.setattr(app_module, "send_message", record_message)
+        transport = httpx.ASGITransport(app=app_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            payload = sample_payload() | {"event_id": "event-race"}
+            first_request = asyncio.create_task(
+                client.post(
+                    "/notify",
+                    headers={"X-Alerts-Token": "shared-secret"},
+                    json=payload,
+                ),
+            )
+            await first_send_started.wait()
+            second_request = asyncio.create_task(
+                client.post(
+                    "/notify",
+                    headers={"X-Alerts-Token": "shared-secret"},
+                    json=payload,
+                ),
+            )
+            await asyncio.sleep(0)
+            release_send.set()
+            responses = await asyncio.gather(first_request, second_request)
+
+        return [response.status_code for response in responses]
+
+    status_codes = asyncio.run(run_race())
+
+    unused_client.close()
+    assert status_codes == [200, 200]
+    assert send_calls == 1
 
 
 def test_notify_without_event_id_keeps_sending_each_request(monkeypatch: MonkeyPatch) -> None:
