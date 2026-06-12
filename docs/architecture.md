@@ -159,7 +159,7 @@ uvicorn alertsbot.app:app --host 0.0.0.0 --port 9100
 ```
 WorkingDirectory=/alertsbot
 EnvironmentFile=/alertsbot/.env
-ExecStart=/alertsbot/.venv/bin/uvicorn alertsbot.app:app --host ${ALERTS_APP_HOST} --port ${ALERTS_APP_PORT}
+ExecStart=/alertsbot/.venv/bin/uvicorn alertsbot.app:app --host ${ALERTS_APP_HOST} --port ${ALERTS_APP_PORT} --workers 1
 Restart=always, RestartSec=5
 ```
 
