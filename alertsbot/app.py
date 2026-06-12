@@ -31,6 +31,10 @@ MESSAGE_MAX_LENGTH = 4096
 DETAILS_MAX_LENGTH = 8192
 EVENT_ID_MAX_LENGTH = 128
 IDEMPOTENCY_TTL_SECONDS = 3600.0
+IDEMPOTENCY_MAX_RECORDS = 10_000
+# Реплеим только постоянные исходы; временные (502) не кэшируем, чтобы повтор
+# клиента с тем же event_id делал реальную новую попытку отправки.
+CACHEABLE_ERROR_STATUS_CODES = frozenset({422, 424})
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,12 @@ class NotifyResult:
 class IdempotencyRecord:
     result: NotifyResult
     expires_at: float
+
+
+@dataclass(slots=True)
+class EventLockEntry:
+    lock: asyncio.Lock
+    refs: int = 0
 
 
 class NotifyRequest(BaseModel):
@@ -82,7 +92,7 @@ redoc_url = None if settings.is_production else "/redoc"
 openapi_url = None if settings.is_production else "/openapi.json"
 
 _idempotency_records: dict[str, IdempotencyRecord] = {}
-_idempotency_locks: dict[str, asyncio.Lock] = {}
+_idempotency_locks: dict[str, EventLockEntry] = {}
 _idempotency_index_lock = asyncio.Lock()
 
 
@@ -143,20 +153,27 @@ def _prune_expired_idempotency_records(now: float) -> None:
     ]
     for event_id in expired_event_ids:
         _idempotency_records.pop(event_id, None)
-        lock = _idempotency_locks.get(event_id)
-        if lock is not None and not lock.locked():
-            _idempotency_locks.pop(event_id, None)
 
 
-async def _event_lock(event_id: str) -> asyncio.Lock:
+@asynccontextmanager
+async def _hold_event_lock(event_id: str) -> AsyncIterator[None]:
     async with _idempotency_index_lock:
         _prune_expired_idempotency_records(time.monotonic())
-        lock = _idempotency_locks.get(event_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _idempotency_locks[event_id] = lock
+        entry = _idempotency_locks.get(event_id)
+        if entry is None:
+            entry = EventLockEntry(lock=asyncio.Lock())
+            _idempotency_locks[event_id] = entry
 
-        return lock
+        entry.refs += 1
+
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        async with _idempotency_index_lock:
+            entry.refs -= 1
+            if entry.refs <= 0:
+                _idempotency_locks.pop(event_id, None)
 
 
 def _cached_notify_result(event_id: str) -> NotifyResult | None:
@@ -174,6 +191,10 @@ def _cached_notify_result(event_id: str) -> NotifyResult | None:
 
 
 def _remember_notify_result(event_id: str, result: NotifyResult) -> None:
+    while len(_idempotency_records) >= IDEMPOTENCY_MAX_RECORDS:
+        oldest_event_id = next(iter(_idempotency_records))
+        _idempotency_records.pop(oldest_event_id)
+
     _idempotency_records[event_id] = IdempotencyRecord(
         result=result,
         expires_at=time.monotonic() + IDEMPOTENCY_TTL_SECONDS,
@@ -230,8 +251,7 @@ async def _send_notify_once_per_event(payload: NotifyRequest) -> dict[str, str]:
     if payload.event_id is None:
         return await _send_notify(payload)
 
-    lock = await _event_lock(payload.event_id)
-    async with lock:
+    async with _hold_event_lock(payload.event_id):
         cached_result = _cached_notify_result(payload.event_id)
         if cached_result is not None:
             return _replay_notify_result(cached_result)
@@ -239,7 +259,8 @@ async def _send_notify_once_per_event(payload: NotifyRequest) -> dict[str, str]:
         try:
             result_body = await _send_notify(payload)
         except HTTPException as error:
-            _remember_notify_result(payload.event_id, _exception_result(error))
+            if error.status_code in CACHEABLE_ERROR_STATUS_CODES:
+                _remember_notify_result(payload.event_id, _exception_result(error))
             raise
 
         _remember_notify_result(

@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from pytest import LogCaptureFixture, MonkeyPatch
+from pytest import LogCaptureFixture, MonkeyPatch, raises
 
 from alertsbot.config import get_settings
 from alertsbot.telegram import TelegramPayloadError, TelegramPermanentError, TelegramRateLimitError
@@ -493,3 +493,132 @@ def test_notify_passes_lifespan_client_pool_to_sender(monkeypatch: MonkeyPatch) 
     unused_client.close()
     assert response.status_code == 200
     assert captured_pools
+
+
+def test_notify_retries_event_id_after_temporary_error(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+    send_calls = 0
+
+    async def fail_then_send(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        nonlocal send_calls
+        send_calls += 1
+        if send_calls == 1:
+            raise httpx.ConnectError("telegram down")
+
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", fail_then_send)
+    payload = sample_payload() | {"event_id": "event-temporary"}
+
+    first_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+    second_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+
+    assert first_response.status_code == 502
+    assert second_response.status_code == 200
+    assert send_calls == 2
+
+
+def test_notify_replays_event_id_payload_error_without_duplicate_send(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+    send_calls = 0
+
+    async def reject_payload(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        nonlocal send_calls
+        send_calls += 1
+        raise TelegramPayloadError("bad payload", status_code=400)
+
+    monkeypatch.setattr(app_module, "send_message", reject_payload)
+    payload = sample_payload() | {"event_id": "event-payload"}
+
+    first_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+    second_response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=payload,
+    )
+
+    assert first_response.status_code == 422
+    assert second_response.status_code == 422
+    assert send_calls == 1
+
+
+def test_notify_evicts_oldest_event_id_when_cache_is_full(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+    sent_event_ids: list[str] = []
+
+    async def record_message(
+        token: str,
+        chat_id: str,
+        text: str,
+        timeout: float,
+        proxy_urls: Sequence[str],
+        circuit_breaker_seconds: float,
+        **kwargs: object,
+    ) -> str:
+        sent_event_ids.append(text.splitlines()[0])
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", record_message)
+    monkeypatch.setattr(app_module, "IDEMPOTENCY_MAX_RECORDS", 2)
+
+    for event_id in ("event-1", "event-2", "event-3"):
+        payload = sample_payload() | {"service": event_id, "event_id": event_id}
+        client.post("/notify", headers={"X-Alerts-Token": "shared-secret"}, json=payload)
+
+    evicted_payload = sample_payload() | {"service": "event-1", "event_id": "event-1"}
+    cached_payload = sample_payload() | {"service": "event-3", "event_id": "event-3"}
+    client.post("/notify", headers={"X-Alerts-Token": "shared-secret"}, json=evicted_payload)
+    client.post("/notify", headers={"X-Alerts-Token": "shared-secret"}, json=cached_payload)
+
+    assert sent_event_ids == ["event-1", "event-2", "event-3", "event-1"]
+    assert len(app_module._idempotency_records) == 2
+
+
+def test_notify_cleans_event_lock_after_unhandled_error(monkeypatch: MonkeyPatch) -> None:
+    app_module, client = load_notify_app(monkeypatch)
+
+    async def explode(payload: object) -> dict[str, str]:
+        raise RuntimeError("unexpected failure")
+
+    monkeypatch.setattr(app_module, "_send_notify", explode)
+    payload = sample_payload() | {"event_id": "event-crash"}
+
+    with raises(RuntimeError):
+        client.post(
+            "/notify",
+            headers={"X-Alerts-Token": "shared-secret"},
+            json=payload,
+        )
+
+    assert app_module._idempotency_locks == {}
+    assert "event-crash" not in app_module._idempotency_records

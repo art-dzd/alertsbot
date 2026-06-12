@@ -200,7 +200,7 @@ def test_send_message_retries_429_after_bounded_retry_after(monkeypatch: MonkeyP
 
     assert used_proxy == "http://primary:8888"
     assert FakeAsyncClient.calls == ["http://primary:8888", "http://primary:8888"]
-    assert sleeps == [1.0]
+    assert sleeps == [10.0]
 
 
 def test_send_message_raises_429_after_retry_is_exhausted(monkeypatch: MonkeyPatch) -> None:
@@ -222,7 +222,7 @@ def test_send_message_raises_429_after_retry_is_exhausted(monkeypatch: MonkeyPat
         send_for_test(("http://primary:8888",))
 
     assert FakeAsyncClient.calls == ["http://primary:8888", "http://primary:8888"]
-    assert sleeps == [1.0]
+    assert sleeps == [10.0]
 
 
 def test_send_message_ignores_non_numeric_retry_after(monkeypatch: MonkeyPatch) -> None:
