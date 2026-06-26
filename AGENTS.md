@@ -60,7 +60,5 @@ uvicorn alertsbot.app:app --host 0.0.0.0 --port 9100
 - Выполнить `bash scripts/restart.sh` в каталоге проекта.
 - Проверить `systemctl status alertsbot`, `healthz` и `journalctl`.
 
-## SSH и прокси
-- Для SSH используй короткие алиасы (`ssh aws`, `ssh macmini`, `ssh mts`, `ssh racknerd`, `ssh vpn`).
-- Для внешних `ssh/scp/rsync` отключай прокси:
-`env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY <command>`.
+## SSH
+- Серверы подключаются через короткие алиасы из `~/.ssh/config`; актуальный список смотри командой `grep -E '^Host ' ~/.ssh/config`.
