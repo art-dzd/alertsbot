@@ -35,6 +35,20 @@ IDEMPOTENCY_MAX_RECORDS = 10_000
 # Реплеим только постоянные исходы; временные (502) не кэшируем, чтобы повтор
 # клиента с тем же event_id делал реальную новую попытку отправки.
 CACHEABLE_ERROR_STATUS_CODES = frozenset({422, 424})
+QUIET_HEALTH_PATHS = frozenset({"/health", "/healthz", "/readyz"})
+
+
+class HealthAccessFilter(logging.Filter):
+    """Не пишет успешные health-check, но сохраняет их ошибки."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not isinstance(record.args, tuple) or len(record.args) != 5:
+            return True
+        _client, method, target, _version, status = record.args
+        if not isinstance(target, str):
+            return True
+        path = target.partition("?")[0]
+        return not (method == "GET" and path in QUIET_HEALTH_PATHS and 200 <= int(status) < 400)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +129,7 @@ app = FastAPI(
 logging.basicConfig(level=settings.log_level)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").addFilter(HealthAccessFilter())
 logger = logging.getLogger("alertsbot")
 
 
