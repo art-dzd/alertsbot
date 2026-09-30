@@ -80,7 +80,12 @@ def test_readyz_endpoint_reports_ready_with_valid_config(monkeypatch: MonkeyPatc
 def test_health_access_filter_hides_only_success(monkeypatch: MonkeyPatch) -> None:
     load_app_with_env(monkeypatch, "production")
     access_filter = logging.getLogger("uvicorn.access").filters[-1]
+    assert isinstance(access_filter, logging.Filter)
 
     assert access_filter.filter(access_record("/healthz", 200)) is False
     assert access_filter.filter(access_record("/readyz", 503)) is True
     assert access_filter.filter(access_record("/notify", 200)) is True
+
+    unexpected_record = access_record("/healthz", 200)
+    unexpected_record.args = ("127.0.0.1:1234", "GET", "/healthz", "1.1", None)
+    assert access_filter.filter(unexpected_record) is True

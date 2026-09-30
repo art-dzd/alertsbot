@@ -45,10 +45,10 @@ class HealthAccessFilter(logging.Filter):
         if not isinstance(record.args, tuple) or len(record.args) != 5:
             return True
         _client, method, target, _version, status = record.args
-        if not isinstance(target, str):
+        if not isinstance(target, str) or not isinstance(status, int):
             return True
         path = target.partition("?")[0]
-        return not (method == "GET" and path in QUIET_HEALTH_PATHS and 200 <= int(status) < 400)
+        return not (method == "GET" and path in QUIET_HEALTH_PATHS and 200 <= status < 400)
 
 
 @dataclass(frozen=True, slots=True)
