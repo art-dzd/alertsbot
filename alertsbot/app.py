@@ -96,9 +96,9 @@ _idempotency_index_lock = asyncio.Lock()
 async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
     fastapi_app.state.telegram_client_pool = TelegramClientPool(settings.request_timeout_seconds)
     history.cleanup()
-    logger.info("Сервис запущен", extra={"event": "startup"})
     if VERSION == "unknown":
         logger.error("Версия выпуска неизвестна", extra={"event": "version_unavailable"})
+    logger.info("Сервис запущен", extra={"event": "startup"})
     try:
         yield
     finally:
@@ -376,7 +376,6 @@ async def notify(request: Request) -> JSONResponse:
                     "history_id": row_id,
                     "event_id": _logged_event_id(payload.event_id) if payload else None,
                     "alert_service": payload.service[:SERVICE_MAX_LENGTH] if payload else None,
-                    "alert_title": payload.title[:TITLE_MAX_LENGTH] if payload else None,
                     "client": client,
                     "method": "POST",
                     "route": "/notify",

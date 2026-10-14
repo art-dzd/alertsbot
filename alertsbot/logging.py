@@ -83,20 +83,6 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(fields, ensure_ascii=True, allow_nan=False)
 
 
-class AccessFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not isinstance(record.args, tuple) or len(record.args) != 5:
-            return True
-        _, method, target, _, status = record.args
-        if not isinstance(target, str) or not isinstance(status, int):
-            return True
-        path = target.partition("?")[0]
-        return not (
-            path == "/notify"
-            or (method == "GET" and path in {"/health", "/healthz", "/readyz"} and status < 400)
-        )
-
-
 def configure_logging(level: str, secrets: tuple[str, ...] = ()) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter(secrets))
@@ -112,6 +98,3 @@ def configure_logging(level: str, secrets: tuple[str, ...] = ()) -> None:
         library.handlers.clear()
         library.propagate = True
         library.setLevel(logging.WARNING)
-    access = logging.getLogger("uvicorn.access")
-    access.filters.clear()
-    access.addFilter(AccessFilter())

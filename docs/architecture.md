@@ -94,7 +94,7 @@ Settings их не читает. Пустые/placeholder секреты в prod
 `startup` пишется при старте после подготовки истории.
 
 `notify_done`: `outcome`, `reason`, `history_id`, `event_id`, `alert_service`,
-`alert_title`, `client`, `method`, `route`, `http_status`, `duration_ms`, `telegram_ms`,
+`client`, `method`, `route`, `http_status`, `duration_ms`, `telegram_ms`,
 `proxy`, `attempts`, `cached`, `telegram_status`, `error_code`, `exception_type`.
 `request_id` берётся из безопасного X-Request-ID (ASCII, до 128 символов), иначе
 генерируется; возвращается в заголовке ответа. Тексты message/details в общий журнал

@@ -16,6 +16,8 @@ for line in sys.stdin:
         sys.exit("Deploy failed: ERROR in new invocation")
     if record.get("event") == "startup" and record.get("version") == version:
         startup_seen = True
+        # Дальше рабочий трафик: ERROR доставки клиента не повод откатывать выпуск.
+        break
 if not startup_seen:
     sys.exit("Deploy failed: startup with target version is missing")
 print(f"Startup verified: {version}, no ERROR")

@@ -38,16 +38,13 @@ CREATE INDEX IF NOT EXISTS alerts_created_at ON alerts(created_at);
 class History:
     def __init__(self, path: str) -> None:
         self.path = path
-        self._initialized = False
         self._last_cleanup = float("-inf")
 
     def _execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> int | None:
         # lean: короткие синхронные записи для ~15 отправителей, без очереди и потока.
         try:
             with closing(sqlite3.connect(self.path, timeout=0.1)) as connection, connection:
-                if not self._initialized:
-                    connection.executescript(SCHEMA)
-                    self._initialized = True
+                connection.executescript(SCHEMA)
                 cursor = connection.execute(sql, parameters)
                 return cursor.lastrowid or 0
         except (sqlite3.Error, OSError, UnicodeError) as error:

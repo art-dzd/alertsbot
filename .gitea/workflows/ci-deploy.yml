@@ -128,6 +128,7 @@ jobs:
           sudo systemctl is-active --quiet alertsbot
           test "$(sudo systemctl show alertsbot -p InvocationID --value)" = "$NEW_INVOCATION"
           RELEASE_VERSION="$(sudo -u alertsbot git rev-parse --short=12 HEAD)"
+          sudo journalctl --sync
           sudo journalctl "_SYSTEMD_INVOCATION_ID=$NEW_INVOCATION" --no-pager -o cat |
             python3 scripts/check_startup.py "$RELEASE_VERSION"
 

@@ -43,7 +43,7 @@ diff /etc/systemd/system/alertsbot.service /alertsbot/systemd/alertsbot.service
 ```
 
 Живость: `healthz` → ok. Готовность: `readyz` → ready (конфиг и БД; не Telegram).
-Обязательно startup с SHA выпуска, отсутствие ERROR нового запуска, установленный
+Обязательно startup с SHA выпуска, отсутствие ERROR до записи startup, установленный
 юнит совпадает с репо. Чтение последних алертов через python3+sqlite3 — [AGENTS.md](../AGENTS.md).
 Политика journald на хосте должна хранить JSON-логи минимум 14 дней; репо её не меняет.
 

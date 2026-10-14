@@ -79,4 +79,4 @@ Journald должен сохранять рабочие логи минимум 
 
 Системный юнит: `systemd/alertsbot.service`. Канонический выпуск — Gitea CI;
 `bash scripts/restart.sh` — резервный путь. После рестарта обязательны health,
-`startup` с SHA выпуска и отсутствие ERROR нового запуска.
+`startup` с SHA выпуска и отсутствие ERROR до неё.

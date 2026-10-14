@@ -45,3 +45,13 @@ def test_retention_at_startup_and_at_most_hourly(monkeypatch: MonkeyPatch, tmp_p
     store.insert({"message": "new"}, "test")
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT count(*) FROM alerts WHERE created_at='2000'").fetchone() == (0,)
+
+
+def test_history_recovers_after_database_file_removed(tmp_path: Path) -> None:
+    path = tmp_path / "history.db"
+    store = history.History(str(path))
+    assert store.insert({"message": "first"}, "test") is not None
+
+    path.unlink()
+
+    assert store.insert({"message": "second"}, "test") is not None

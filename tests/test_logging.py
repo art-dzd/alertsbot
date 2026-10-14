@@ -64,10 +64,17 @@ def test_formatter_redacts_tokens_and_library_messages() -> None:
         ([{"event": "startup", "version": "old", "level": "INFO"}], 1),
         (
             [
-                {"event": "startup", "version": "123456abcdef", "level": "INFO"},
                 {"event": "history_error", "level": "ERROR"},
+                {"event": "startup", "version": "123456abcdef", "level": "INFO"},
             ],
             1,
+        ),
+        (
+            [
+                {"event": "startup", "version": "123456abcdef", "level": "INFO"},
+                {"event": "notify_done", "level": "ERROR"},
+            ],
+            0,
         ),
         ([{"event": "startup", "version": "123456abcdef", "level": "CRITICAL"}], 1),
         ([], 1),
