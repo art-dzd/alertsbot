@@ -13,7 +13,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Any, TypedDict, cast
 from uuid import uuid4
 
 BATCH_LIMIT = 100
@@ -21,6 +21,9 @@ PENDING_MAX_AGE = timedelta(minutes=5)
 MESSAGE_PREVIEW_LIMIT = 300
 MESSAGE_LIMIT = 6000
 MOSCOW = timezone(timedelta(hours=3))
+# Худший проход: два ssh-маршрута и tpanel укладываются в TimeoutStartSec=55s юнита.
+SSH_TIMEOUT_SECONDS = 15
+TPANEL_TIMEOUT_SECONDS = 20
 OUTAGE_REPORT_AFTER = timedelta(minutes=3)
 SSH_UNREACHABLE = 255
 ALERTSBOT_NOT_READY = 3
@@ -43,17 +46,19 @@ with closing(sqlite3.connect(
     'file:/var/lib/alertsbot/alerts.db?mode=ro', uri=True, timeout=5
 )) as db:
     db.row_factory = sqlite3.Row
-    maximum = 0
+    maximum = db.execute('SELECT COALESCE(MAX(id), 0) FROM alerts').fetchone()[0]
     rows = []
-    if sys.argv[1] == 'init':
-        maximum = db.execute('SELECT COALESCE(MAX(id), 0) FROM alerts').fetchone()[0]
-    else:
+    reset = False
+    if sys.argv[1] != 'init':
+        cursor = int(sys.argv[1])
+        # Файл истории пересоздали — id пошли заново, читаем с начала.
+        reset = cursor > maximum
         rows = [dict(row) for row in db.execute(
             'SELECT id, created_at, service, title, message, status, http_status, reason, cached '
             'FROM alerts WHERE id > ? ORDER BY id LIMIT ?',
-            (int(sys.argv[1]), {BATCH_LIMIT})
+            (0 if reset else cursor, {BATCH_LIMIT})
         )]
-    print(json.dumps({{'max_id': maximum, 'rows': rows}}, ensure_ascii=True))
+    print(json.dumps({{'max_id': maximum, 'rows': rows, 'reset': reset}}, ensure_ascii=True))
 """
 
 
@@ -77,10 +82,11 @@ def parse_time(value: str) -> datetime:
     return parsed
 
 
-def fetch_history(last_id: int | None) -> tuple[int, list[Alert]]:
+def fetch_history(last_id: int | None) -> tuple[int, list[Alert], bool, int]:
+    """Возвращает max(id), новые строки, признак сброса id и номер ssh-маршрута."""
     cursor = "init" if last_id is None else str(last_id)
     command = f"sudo -n -u alertsbot python3 -c {shlex.quote(REMOTE_QUERY)} {cursor}"
-    for route in SSH_ROUTES:
+    for route_index, route in enumerate(SSH_ROUTES):
         try:
             response = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *route, "mts", command],
@@ -89,22 +95,23 @@ def fetch_history(last_id: int | None) -> tuple[int, list[Alert]]:
                 stderr=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
-                timeout=25,
+                timeout=SSH_TIMEOUT_SECONDS,
             )
             break
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
             unreachable = isinstance(error, subprocess.TimeoutExpired) or (
                 error.returncode == SSH_UNREACHABLE
             )
-            if not unreachable or route is SSH_ROUTES[-1]:
+            if not unreachable or route_index == len(SSH_ROUTES) - 1:
                 raise
     data = json.loads(response.stdout)
     if not isinstance(data, dict) or type(data.get("max_id")) is not int or data["max_id"] < 0:
         raise ValueError("invalid_history")
     rows = data.get("rows")
-    if not isinstance(rows, list) or len(rows) > BATCH_LIMIT:
+    reset = data.get("reset")
+    if not isinstance(rows, list) or len(rows) > BATCH_LIMIT or not isinstance(reset, bool):
         raise ValueError("invalid_history")
-    previous = last_id or 0
+    previous = 0 if reset else last_id or 0
     for row in rows:
         if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= previous:
             raise ValueError("invalid_history")
@@ -121,7 +128,7 @@ def fetch_history(last_id: int | None) -> tuple[int, list[Alert]]:
             raise ValueError("invalid_history")
         parse_time(row["created_at"])
         previous = row["id"]
-    return data["max_id"], cast(list[Alert], rows)
+    return data["max_id"], cast(list[Alert], rows), reset, route_index
 
 
 def compact(value: str | None, limit: int) -> str:
@@ -129,10 +136,11 @@ def compact(value: str | None, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def format_message(rows: list[Alert], id_from: int, id_to: int) -> str:
-    text = f"Алерты: {len(rows)} · история id {id_from}–{id_to}"
-    for index, row in enumerate(rows):
-        timestamp = moscow_time(row["created_at"])
+def format_message(rows: list[Alert]) -> tuple[str, int]:
+    """Сводка из первых алертов в пределах MESSAGE_LIMIT; возвращает текст и число показанных."""
+    blocks: list[str] = []
+    size = 0
+    for row in rows:
         status = row["status"]
         if status == "failed":
             status += f" {row['http_status']}" if row["http_status"] is not None else ""
@@ -140,21 +148,21 @@ def format_message(rows: list[Alert], id_from: int, id_to: int) -> str:
             status += " (итог неизвестен)"
         reason = compact(row["reason"], 256)
         block = (
-            f"\n#{row['id']} · {timestamp} МСК · {compact(row['service'], 128) or '—'} · "
+            f"\n#{row['id']} · {moscow_time(row['created_at'])} МСК · "
+            f"{compact(row['service'], 128) or '—'} · "
             f"{compact(row['title'], 256) or '—'} · {status}"
             + (f" · {reason}" if reason else "")
             + f"\n{compact(row['message'], MESSAGE_PREVIEW_LIMIT)}"
         )
-        remaining = rows[index + 1 :]
-        suffix = (
-            f"\nещё {len(remaining)}, id {remaining[0]['id']}–{remaining[-1]['id']}"
-            if remaining
-            else ""
-        )
-        if len(text) + len(block) + len(suffix) > MESSAGE_LIMIT:
-            return text + f"\nещё {len(rows) - index}, id {row['id']}–{rows[-1]['id']}"
-        text += block
-    return text
+        if blocks and size + len(block) > MESSAGE_LIMIT:
+            break
+        blocks.append(block)
+        size += len(block)
+    shown = len(blocks)
+    header = f"Алерты: {shown} · история id {rows[0]['id']}–{rows[shown - 1]['id']}"
+    if shown < len(rows):
+        header += f" · ещё {len(rows) - shown} следующей сводкой"
+    return header + "".join(blocks), shown
 
 
 def moscow_time(value: str) -> str:
@@ -170,7 +178,7 @@ def say(text: str) -> None:
         stderr=subprocess.DEVNULL,
         text=True,
         encoding="utf-8",
-        timeout=25,
+        timeout=TPANEL_TIMEOUT_SECONDS,
     )
 
 
@@ -183,13 +191,24 @@ def outage_problem(error: Exception) -> str:
     return "история alertsbot не читается"
 
 
+def read_outage(path: Path) -> dict[str, Any] | None:
+    try:
+        outage = json.loads(path.read_text(encoding="utf-8"))
+        parse_time(outage["since"])
+        if isinstance(outage["reported"], bool):
+            return cast(dict[str, Any], outage)
+    except FileNotFoundError:
+        return None
+    except (ValueError, KeyError, TypeError):
+        pass
+    # Битый файл считаем отсутствующим: его перезапишет или удалит этот же проход.
+    return None
+
+
 def note_outage(path: Path, problem: str) -> None:
     """Сбой канала дольше OUTAGE_REPORT_AFTER — одно сообщение во вкладку."""
     now = datetime.now(timezone.utc)
-    try:
-        outage = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        outage = {"since": now.isoformat(), "reported": False}
+    outage = read_outage(path) or {"since": now.isoformat(), "reported": False}
     if not outage["reported"] and now - parse_time(outage["since"]) >= OUTAGE_REPORT_AFTER:
         say(
             f"Канал алертов: {problem} с {moscow_time(outage['since'])} МСК. "
@@ -200,13 +219,10 @@ def note_outage(path: Path, problem: str) -> None:
 
 
 def end_outage(path: Path) -> None:
-    try:
-        outage = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return
-    if outage["reported"]:
+    outage = read_outage(path)
+    if outage is not None and outage["reported"]:
         say(f"Канал алертов снова доступен, сбой был с {moscow_time(outage['since'])} МСК.")
-    path.unlink()
+    path.unlink(missing_ok=True)
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -226,7 +242,9 @@ def log_result(started: float, work_id: str, **fields: object) -> None:
         json.dumps(
             {
                 "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "level": "ERROR" if fields.get("outcome") == "error" else "INFO",
+                "level": {"error": "ERROR", "fallback": "WARNING"}.get(
+                    str(fields.get("outcome")), "INFO"
+                ),
                 "service": "alerts-tab-forwarder",
                 "version": VERSION,
                 "event": "forward_done",
@@ -259,7 +277,7 @@ def main() -> int:
         stage = "ssh"
         stage_started = time.monotonic()
         try:
-            maximum, rows = fetch_history(last_id)
+            maximum, rows, reset, route_index = fetch_history(last_id)
         except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
             # Сбой сообщения о сбое пишется в итог с этапом outage, исходный — в его контекст.
             stage = "outage"
@@ -285,6 +303,11 @@ def main() -> int:
             )
             return 0
 
+        # Деградации пишутся и в пустом проходе: иначе их не видно.
+        reasons = ["history_reset"] * reset + ["ssh_via_vpn"] * (route_index > 0)
+        outcome = "fallback" if reasons else "ok"
+        if reset:
+            last_id = 0
         ready: list[Alert] = []
         now = datetime.now(timezone.utc)
         for row in rows:
@@ -292,11 +315,24 @@ def main() -> int:
                 break
             ready.append(row)
         if not ready:
+            if reasons:
+                stage = "state"
+                write_atomic(state, f"{last_id}\n")
+                log_result(
+                    started, work_id, outcome=outcome, reason=";".join(reasons), count=0,
+                    ssh_ms=ssh_ms,
+                )
             return 0
         alerts = [row for row in ready if not row["cached"]]
         tpanel_ms = 0.0
         if alerts:
-            message = format_message(alerts, ready[0]["id"], ready[-1]["id"])
+            message, shown = format_message(alerts)
+            if shown < len(alerts):
+                alerts = alerts[:shown]
+                ready = [row for row in ready if row["id"] <= alerts[-1]["id"]]
+            # Курсор не записать — не шлём, иначе та же сводка уйдёт снова через минуту.
+            stage = "state"
+            write_atomic(state, f"{last_id}\n")
             stage = "tpanel"
             stage_started = time.monotonic()
             say(message)
@@ -307,7 +343,8 @@ def main() -> int:
         log_result(
             started,
             work_id,
-            outcome="ok",
+            outcome=outcome,
+            reason=";".join(reasons),
             count=len(alerts),
             processed_count=len(ready),
             id_from=ready[0]["id"],

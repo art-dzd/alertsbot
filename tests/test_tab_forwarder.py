@@ -40,6 +40,7 @@ class Commands:
         self.max_id = 42
         self.ssh_code = 0
         self.ssh_codes: list[int] = []
+        self.reset = False
         self.now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
         self.tpanel_code = 0
         self.calls: list[list[str]] = []
@@ -55,7 +56,9 @@ class Commands:
             assert command[-2] == "mts"
             code = self.ssh_codes.pop(0) if self.ssh_codes else self.ssh_code
             result = subprocess.CompletedProcess(
-                command, code, json.dumps({"max_id": self.max_id, "rows": self.rows})
+                command,
+                code,
+                json.dumps({"max_id": self.max_id, "rows": self.rows, "reset": self.reset}),
             )
             if kwargs.get("check"):
                 result.check_returncode()
@@ -149,7 +152,7 @@ def test_cached_rows_are_skipped_but_cursor_advances(commands: Commands, tmp_pat
     commands.rows = [alert(2, cached=1), alert(3), alert(4, cached=1)]
     assert tab_forwarder.main() == 0
     assert state.read_text() == "4\n"
-    assert "Алерты: 1 · история id 2–4" in commands.messages[0]
+    assert "Алерты: 1 · история id 3–3" in commands.messages[0]
     assert "#2" not in commands.messages[0]
     assert "#4" not in commands.messages[0]
 
@@ -183,18 +186,18 @@ def test_message_preview_and_total_size_are_bounded(commands: Commands, tmp_path
     (tmp_path / "last_id").write_text("0\n")
     commands.rows = [alert(i, message="я" * 10000) for i in range(1, 31)]
     assert tab_forwarder.main() == 0
-    assert (tmp_path / "last_id").read_text() == "30\n"
     text = commands.messages[0]
     assert len(text) <= 6000
     assert "я" * 300 + "…" in text
     assert "я" * 301 not in text
-    summary = re.search(r"ещё (\d+), id (\d+)–30$", text)
-    assert summary is not None
-    omitted, first_omitted = map(int, summary.groups())
     displayed = len(re.findall(r"^#\d+ ·", text, re.MULTILINE))
-    assert displayed > 0
-    assert displayed + omitted == 30
-    assert first_omitted == displayed + 1
+    assert 0 < displayed < 30
+    assert f"ещё {30 - displayed} следующей сводкой" in text
+    # Курсор только до показанного: остальное придёт следующим проходом, а не пропадёт.
+    assert (tmp_path / "last_id").read_text() == f"{displayed}\n"
+    commands.rows = commands.rows[displayed:]
+    assert tab_forwarder.main() == 0
+    assert f"#{displayed + 1} ·" in commands.messages[1]
 
 
 def test_empty_pass_is_quiet_and_uses_custom_tab(
@@ -233,13 +236,13 @@ def test_atomic_state_write_failure_is_safe(
     commands.rows = [alert(11)]
 
     def fail_replace(source: str, destination: Path) -> None:
-        assert Path(source).read_text() == "11\n"
-        assert destination.read_text() == "10\n"
         raise PermissionError("SECRET_EXCEPTION")
 
     monkeypatch.setattr("scripts.tab_forwarder.os.replace", fail_replace)
     assert tab_forwarder.main() != 0
     assert state.read_text() == "10\n"
+    # Курсор не записать — сводку не шлём, иначе она повторялась бы каждую минуту.
+    assert commands.messages == []
     output = capsys.readouterr().out
     assert "SECRET_EXCEPTION" not in output
     assert json.loads(output)["stage"] == "state"
@@ -301,7 +304,13 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
 
     monkeypatch.setattr(sys, "argv", ["-c", "init"])
     exec(compile(remote[6], "remote_query", "exec"), {})
-    assert json.loads(capsys.readouterr().out) == {"max_id": 105, "rows": []}
+    assert json.loads(capsys.readouterr().out) == {"max_id": 105, "rows": [], "reset": False}
+
+    monkeypatch.setattr(sys, "argv", ["-c", "500"])
+    exec(compile(remote[6], "remote_query", "exec"), {})
+    data = json.loads(capsys.readouterr().out)
+    assert data["reset"] is True
+    assert [row["id"] for row in data["rows"]] == list(range(1, 101))
 
 
 def test_unreachable_tailnet_falls_back_to_vpn_route(commands: Commands, tmp_path: Path) -> None:
@@ -346,3 +355,26 @@ def test_channel_outage_reported_once_and_recovery(
     assert "снова доступен" in commands.messages[1]
     assert not (tmp_path / "outage").exists()
     capsys.readouterr()
+
+
+def test_history_reset_rereads_from_start_with_warning(
+    commands: Commands, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    (tmp_path / "last_id").write_text("500\n")
+    commands.reset = True
+    commands.max_id = 2
+    commands.rows = [alert(1), alert(2)]
+    assert tab_forwarder.main() == 0
+    assert "#1 ·" in commands.messages[0]
+    assert (tmp_path / "last_id").read_text() == "2\n"
+    log = json.loads(capsys.readouterr().out)
+    assert (log["level"], log["reason"]) == ("WARNING", "history_reset")
+
+
+def test_broken_outage_file_does_not_block_delivery(commands: Commands, tmp_path: Path) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    (tmp_path / "outage").write_text("{broken")
+    commands.rows = [alert(11)]
+    assert tab_forwarder.main() == 0
+    assert len(commands.messages) == 1
+    assert not (tmp_path / "outage").exists()
