@@ -27,13 +27,13 @@ def test_retention_at_startup_and_at_most_hourly(monkeypatch: MonkeyPatch, tmp_p
     with closing(sqlite3.connect(path)) as db, db:
         db.executemany(
             "INSERT INTO alerts(created_at, client, status) VALUES (?, 'test', 'sent')",
-            [("2026-07-15T23:59:59.000+00:00",), ("2026-07-16T00:00:00.000+00:00",)],
+            [("2021-10-13T23:59:59.000+00:00",), ("2021-10-14T00:00:00.000+00:00",)],
         )
     store = history.History(path)
     store.cleanup()
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT created_at FROM alerts").fetchall() == [
-            ("2026-07-16T00:00:00.000+00:00",),
+            ("2021-10-14T00:00:00.000+00:00",),
         ]
     with closing(sqlite3.connect(path)) as db, db:
         db.execute("INSERT INTO alerts(created_at, client, status) VALUES ('2000', 'test', 'sent')")

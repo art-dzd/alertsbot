@@ -12,7 +12,8 @@ from typing import Any
 from alertsbot.logging import exception_fields, utc_now
 
 logger = logging.getLogger(__name__)
-RETENTION_DAYS = 90
+# Алерты редкие и лёгкие (~70 МБ/год при 100 в день), а повторы и тренды ищем на годы назад.
+RETENTION_DAYS = 1826  # 5 лет
 CLEANUP_INTERVAL_SECONDS = 3600
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts (

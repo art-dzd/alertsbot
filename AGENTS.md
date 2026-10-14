@@ -32,7 +32,7 @@ Python 3.10+, stdlib SQLite, существующие FastAPI/httpx/pydantic. О
 
 Прод: `/alertsbot`, пользователь/юнит `alertsbot`. systemd создаёт
 `/var/lib/alertsbot` с правами `0700`; история по умолчанию —
-`/var/lib/alertsbot/alerts.db` (`ALERTS_DB_PATH`). Хранение 90 дней, чистка при
+`/var/lib/alertsbot/alerts.db` (`ALERTS_DB_PATH`). Хранение 5 лет, чистка при
 старте и на запросах не чаще раза в час. `pending` означает незавершённую обработку,
 `sent` — успех, `failed` — сбой, `rejected` — отклонённое тело.
 
