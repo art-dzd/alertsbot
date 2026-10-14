@@ -13,4 +13,4 @@ Environment=ALERTS_TAB=admin/alerts
 ExecStart=/usr/local/bin/alerts-tab-forwarder
 TimeoutStartSec=55s
 # Пульс обновляется только после успешного прохода, включая пустой.
-ExecStartPost=+/usr/bin/python3 -c "import os, tempfile, time\nfrom pathlib import Path\ntry:\n    path = Path('/var/lib/prometheus/node-exporter/alerts_tab_forwarder.prom')\n    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix='.alerts_tab_forwarder-', delete=False) as tmp:\n        try:\n            tmp.write('alerts_tab_forwarder_last_success_timestamp_seconds ' + str(int(time.time())) + chr(10))\n            tmp.flush()\n            os.fchmod(tmp.fileno(), 0o644)\n            os.fsync(tmp.fileno())\n            os.replace(tmp.name, path)\n        finally:\n            Path(tmp.name).unlink(missing_ok=True)\nexcept OSError:\n    raise SystemExit(1) from None"
+ExecStartPost=+/bin/sh -c 'umask 022; f=/var/lib/prometheus/node-exporter/alerts_tab_forwarder.prom; echo "alerts_tab_forwarder_last_success_timestamp_seconds $$(date +%%s)" > $$f.tmp && mv $$f.tmp $$f'

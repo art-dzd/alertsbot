@@ -21,12 +21,23 @@ PENDING_MAX_AGE = timedelta(minutes=5)
 MESSAGE_PREVIEW_LIMIT = 300
 MESSAGE_LIMIT = 6000
 MOSCOW = timezone(timedelta(hours=3))
+OUTAGE_REPORT_AFTER = timedelta(minutes=3)
+SSH_UNREACHABLE = 255
+ALERTSBOT_NOT_READY = 3
+# Сначала напрямую по tailnet, чтобы не зависеть от vpn; запасной путь — ProxyJump из ~/.ssh/config.
+SSH_ROUTES = (("-o", "ProxyJump=none", "-o", "HostName=100.89.26.10"), ())
 VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 REMOTE_QUERY = f"""
 import json
 import sqlite3
 import sys
+import urllib.request
 from contextlib import closing
+
+try:
+    urllib.request.urlopen('http://127.0.0.1:9100/readyz', timeout=5).close()
+except Exception:
+    sys.exit({ALERTSBOT_NOT_READY})
 
 with closing(sqlite3.connect(
     'file:/var/lib/alertsbot/alerts.db?mode=ro', uri=True, timeout=5
@@ -69,15 +80,24 @@ def parse_time(value: str) -> datetime:
 def fetch_history(last_id: int | None) -> tuple[int, list[Alert]]:
     cursor = "init" if last_id is None else str(last_id)
     command = f"sudo -n -u alertsbot python3 -c {shlex.quote(REMOTE_QUERY)} {cursor}"
-    response = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mts", command],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        timeout=25,
-    )
+    for route in SSH_ROUTES:
+        try:
+            response = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *route, "mts", command],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                timeout=25,
+            )
+            break
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            unreachable = isinstance(error, subprocess.TimeoutExpired) or (
+                error.returncode == SSH_UNREACHABLE
+            )
+            if not unreachable or route is SSH_ROUTES[-1]:
+                raise
     data = json.loads(response.stdout)
     if not isinstance(data, dict) or type(data.get("max_id")) is not int or data["max_id"] < 0:
         raise ValueError("invalid_history")
@@ -112,7 +132,7 @@ def compact(value: str | None, limit: int) -> str:
 def format_message(rows: list[Alert], id_from: int, id_to: int) -> str:
     text = f"Алерты: {len(rows)} · история id {id_from}–{id_to}"
     for index, row in enumerate(rows):
-        timestamp = parse_time(row["created_at"]).astimezone(MOSCOW).strftime("%d.%m %H:%M")
+        timestamp = moscow_time(row["created_at"])
         status = row["status"]
         if status == "failed":
             status += f" {row['http_status']}" if row["http_status"] is not None else ""
@@ -137,10 +157,62 @@ def format_message(rows: list[Alert], id_from: int, id_to: int) -> str:
     return text
 
 
-def save_state(path: Path, last_id: int) -> None:
+def moscow_time(value: str) -> str:
+    return parse_time(value).astimezone(MOSCOW).strftime("%d.%m %H:%M")
+
+
+def say(text: str) -> None:
+    subprocess.run(
+        ["/usr/local/bin/tpanel", "say", os.environ.get("ALERTS_TAB", "admin/alerts"), "-"],
+        input=text,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        timeout=25,
+    )
+
+
+def outage_problem(error: Exception) -> str:
+    code = error.returncode if isinstance(error, subprocess.CalledProcessError) else None
+    if code == ALERTSBOT_NOT_READY:
+        return "alertsbot не готов (readyz)"
+    if code == SSH_UNREACHABLE or isinstance(error, subprocess.TimeoutExpired):
+        return "mts недоступен по ssh"
+    return "история alertsbot не читается"
+
+
+def note_outage(path: Path, problem: str) -> None:
+    """Сбой канала дольше OUTAGE_REPORT_AFTER — одно сообщение во вкладку."""
+    now = datetime.now(timezone.utc)
+    try:
+        outage = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        outage = {"since": now.isoformat(), "reported": False}
+    if not outage["reported"] and now - parse_time(outage["since"]) >= OUTAGE_REPORT_AFTER:
+        say(
+            f"Канал алертов: {problem} с {moscow_time(outage['since'])} МСК. "
+            "Новые алерты сюда не доходят, в Telegram — только если alertsbot жив."
+        )
+        outage["reported"] = True
+    write_atomic(path, json.dumps(outage))
+
+
+def end_outage(path: Path) -> None:
+    try:
+        outage = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    if outage["reported"]:
+        say(f"Канал алертов снова доступен, сбой был с {moscow_time(outage['since'])} МСК.")
+    path.unlink()
+
+
+def write_atomic(path: Path, text: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as temporary:
         try:
-            temporary.write(f"{last_id}\n")
+            temporary.write(text)
             temporary.flush()
             os.fsync(temporary.fileno())
             os.replace(temporary.name, path)
@@ -175,7 +247,8 @@ def main() -> int:
     stage = "state"
     stage_started = started
     try:
-        state = Path(os.environ["STATE_DIRECTORY"]) / "last_id"
+        state_directory = Path(os.environ["STATE_DIRECTORY"])
+        state = state_directory / "last_id"
         try:
             last_id = int(state.read_text(encoding="ascii").strip())
         except FileNotFoundError:
@@ -185,12 +258,21 @@ def main() -> int:
 
         stage = "ssh"
         stage_started = time.monotonic()
-        maximum, rows = fetch_history(last_id)
+        try:
+            maximum, rows = fetch_history(last_id)
+        except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+            # Сбой сообщения о сбое пишется в итог с этапом outage, исходный — в его контекст.
+            stage = "outage"
+            note_outage(state_directory / "outage", outage_problem(error))
+            stage = "ssh"
+            raise
         ssh_ms = round((time.monotonic() - stage_started) * 1000, 3)
+        stage = "outage"
+        end_outage(state_directory / "outage")
         if last_id is None:
             stage = "state"
             stage_started = time.monotonic()
-            save_state(state, maximum)
+            write_atomic(state, f"{maximum}\n")
             log_result(
                 started,
                 work_id,
@@ -217,20 +299,11 @@ def main() -> int:
             message = format_message(alerts, ready[0]["id"], ready[-1]["id"])
             stage = "tpanel"
             stage_started = time.monotonic()
-            subprocess.run(
-                ["/usr/local/bin/tpanel", "say", os.environ.get("ALERTS_TAB", "admin/alerts"), "-"],
-                input=message,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                timeout=25,
-            )
+            say(message)
             tpanel_ms = round((time.monotonic() - stage_started) * 1000, 3)
         stage = "state"
         stage_started = time.monotonic()
-        save_state(state, ready[-1]["id"])
+        write_atomic(state, f"{ready[-1]['id']}\n")
         log_result(
             started,
             work_id,

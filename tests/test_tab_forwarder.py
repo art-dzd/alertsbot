@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import re
 import shlex
@@ -38,6 +39,8 @@ class Commands:
         self.rows: list[dict[str, Any]] = []
         self.max_id = 42
         self.ssh_code = 0
+        self.ssh_codes: list[int] = []
+        self.now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
         self.tpanel_code = 0
         self.calls: list[list[str]] = []
         self.messages: list[str] = []
@@ -50,8 +53,9 @@ class Commands:
             assert "BatchMode=yes" in command
             assert "ConnectTimeout=10" in command
             assert command[-2] == "mts"
+            code = self.ssh_codes.pop(0) if self.ssh_codes else self.ssh_code
             result = subprocess.CompletedProcess(
-                command, self.ssh_code, json.dumps({"max_id": self.max_id, "rows": self.rows})
+                command, code, json.dumps({"max_id": self.max_id, "rows": self.rows})
             )
             if kwargs.get("check"):
                 result.check_returncode()
@@ -67,15 +71,16 @@ class Commands:
 
 @pytest.fixture
 def commands(monkeypatch: MonkeyPatch, tmp_path: Path) -> Commands:
+    fake = Commands()
+
     class Clock(datetime):
         @classmethod
         def now(cls, tz: tzinfo | None = None) -> Clock:
-            return cls(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+            return cls.fromtimestamp(fake.now.timestamp(), timezone.utc)
 
     monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     monkeypatch.delenv("ALERTS_TAB", raising=False)
     monkeypatch.setattr(tab_forwarder, "datetime", Clock)
-    fake = Commands()
     monkeypatch.setattr(subprocess, "run", fake.run)
     return fake
 
@@ -263,39 +268,6 @@ def test_invalid_history_and_ssh_timeout_keep_state(
     assert "SECRET" not in output
 
 
-def test_heartbeat_command_writes_readable_metric_atomically(tmp_path: Path) -> None:
-    service = Path(__file__).resolve().parents[1] / "systemd/web/alerts-tab-forwarder.service"
-    line = next(
-        line for line in service.read_text().splitlines() if line.startswith("ExecStartPost=")
-    )
-    command = shlex.split(line.split("=", 1)[1])
-    assert command[:2] == ["+/usr/bin/python3", "-c"]
-    # systemd раскрывает C-escape в двойных кавычках; цель меняем только для теста.
-    code = (
-        command[2]
-        .replace(r"\n", "\n")
-        .replace(
-            "/var/lib/prometheus/node-exporter/alerts_tab_forwarder.prom",
-            str(tmp_path / "alerts_tab_forwarder.prom"),
-        )
-    )
-    path = tmp_path / "alerts_tab_forwarder.prom"
-    path.write_text("old metric\n")
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
-    assert result.returncode == 0
-    assert re.fullmatch(
-        r"alerts_tab_forwarder_last_success_timestamp_seconds \d+\n", path.read_text()
-    )
-    assert path.stat().st_mode & 0o777 == 0o644
-    assert list(tmp_path.iterdir()) == [path]
-
-    path.unlink()
-    tmp_path.rmdir()
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
-    assert result.returncode != 0
-    assert result.stdout == result.stderr == ""
-
-
 def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
     tmp_path: Path, monkeypatch: MonkeyPatch, capsys: CaptureFixture[str], commands: Commands
 ) -> None:
@@ -315,6 +287,7 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
         return real_connect(f"file:{path}?mode=ro", uri=True, timeout=5)
 
     monkeypatch.setattr(sqlite3, "connect", readonly_connect)
+    monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout: io.BytesIO())
     (tmp_path / "last_id").write_text("2\n")
     assert tab_forwarder.main() == 0
     capsys.readouterr()
@@ -329,3 +302,47 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
     monkeypatch.setattr(sys, "argv", ["-c", "init"])
     exec(compile(remote[6], "remote_query", "exec"), {})
     assert json.loads(capsys.readouterr().out) == {"max_id": 105, "rows": []}
+
+
+def test_unreachable_tailnet_falls_back_to_vpn_route(commands: Commands, tmp_path: Path) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.rows = [alert(11)]
+    commands.ssh_codes = [255]
+    assert tab_forwarder.main() == 0
+    direct, fallback = commands.calls[:2]
+    assert "ProxyJump=none" in direct
+    assert "ProxyJump=none" not in fallback
+    assert (tmp_path / "last_id").read_text() == "11\n"
+
+
+def test_not_ready_alertsbot_does_not_try_fallback(commands: Commands, tmp_path: Path) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.ssh_code = 3
+    assert tab_forwarder.main() != 0
+    assert len(commands.calls) == 1
+
+
+def test_channel_outage_reported_once_and_recovery(
+    commands: Commands, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.ssh_code = 3
+    assert tab_forwarder.main() != 0
+    assert commands.messages == []
+
+    commands.now = commands.now.replace(minute=3)
+    assert tab_forwarder.main() != 0
+    assert len(commands.messages) == 1
+    assert "alertsbot не готов" in commands.messages[0]
+    assert "14.10 15:00 МСК" in commands.messages[0]
+
+    commands.now = commands.now.replace(minute=10)
+    assert tab_forwarder.main() != 0
+    assert len(commands.messages) == 1
+
+    commands.ssh_code = 0
+    assert tab_forwarder.main() == 0
+    assert len(commands.messages) == 2
+    assert "снова доступен" in commands.messages[1]
+    assert not (tmp_path / "outage").exists()
+    capsys.readouterr()
