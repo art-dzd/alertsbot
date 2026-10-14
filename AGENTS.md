@@ -63,6 +63,34 @@ Telegram health не вызывает. Метрик ресурсов внутр�
 Сервис сам себе алерты не отправляет; сбои доставки/истории видны в ERROR и истории.
 Journald должен сохранять рабочие логи минимум 14 дней; политика задаётся на хосте.
 
+## Пересыльщик во вкладку (web)
+
+`scripts/tab_forwarder.py` раз в минуту от пользователя server читает историю с mts
+через один `ssh mts` и SQLite `mode=ro`; отправляет одну сводку через `tpanel say`.
+Токен tpanel остаётся на web. Вкладка — `ALERTS_TAB`, по умолчанию `admin/alerts`.
+Первый запуск сохраняет текущий max(id) без отправки старой истории. Позиция —
+`/var/lib/alerts-tab-forwarder/last_id`, меняется атомарно после доставки; cached
+пропускается. Свежий pending задерживает следующие строки, после пяти минут
+показывается с неизвестным итогом. Лимит — 100 строк и 6000 символов за проход;
+не вместившиеся алерты представлены числом и диапазоном id.
+
+Установка на web из корня репо:
+
+```bash
+sudo install -m 0755 scripts/tab_forwarder.py /usr/local/bin/alerts-tab-forwarder
+sudo install -m 0644 systemd/web/alerts-tab-forwarder.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now alerts-tab-forwarder.timer
+journalctl -u alerts-tab-forwarder -n 100 --no-pager -o cat
+```
+
+Успешные проходы, включая пустые, обновляют пульс
+`alerts_tab_forwarder_last_success_timestamp_seconds` в
+`/var/lib/prometheus/node-exporter/alerts_tab_forwarder.prom` (root, 0644).
+Пустые проходы не логируются; работа — один JSON-итог, сбои — ERROR без текста
+алертов и stderr. Версия в журнале — первые 12 символов SHA256 скрипта.
+Подробности установки и остановки — [docs/deploy.md](docs/deploy.md).
+
 ## Документация и проверки
 
 - [Архитектура](docs/architecture.md)

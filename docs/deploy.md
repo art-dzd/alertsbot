@@ -58,3 +58,50 @@ diff /etc/systemd/system/alertsbot.service /alertsbot/systemd/alertsbot.service
 не читать историю, но файл останется для последующего обновления/разбора.
 Автоматический откат проверяет health, а ручная проверка журнала отката остаётся
 за оператором (старые выпуски могут писать прежний формат).
+
+## Пересыльщик во вкладку (web)
+
+Отдельный stdlib-скрипт читает новые строки SQLite с mts по SSH, только `mode=ro`,
+и раз в минуту отправляет одну сводку в `admin/alerts`. Токен tpanel нужен только
+на web; mts его не получает. Устанавливается вручную на web, независимо от
+выкладки FastAPI на mts:
+
+```bash
+sudo install -m 0755 scripts/tab_forwarder.py /usr/local/bin/alerts-tab-forwarder
+sudo install -m 0644 systemd/web/alerts-tab-forwarder.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now alerts-tab-forwarder.timer
+systemctl status alerts-tab-forwarder.timer --no-pager
+journalctl -u alerts-tab-forwarder -n 100 --no-pager -o cat
+```
+
+Пользователю server должны быть доступны SSH-ключ и алиас `mts`, бинарь
+`/usr/local/bin/tpanel` и его `~/.config/tpanel/api.env`. На mts требуется
+беспарольный `sudo -n -u alertsbot python3` для чтения истории. Каталог
+`/var/lib/prometheus/node-exporter` должен уже существовать и собираться
+textfile-коллектором node-exporter.
+
+systemd создаёт `/var/lib/alerts-tab-forwarder` (0700); файл `last_id` (0600)
+содержит последний обработанный id. Первый запуск начинает с текущего max(id),
+старые алерты не пересылает. За проход — до 100 строк по возрастанию id;
+pending младше пяти минут останавливает префикс, более старый показывается как
+`pending (итог неизвестен)`. cached=1 не показывается, но позиция продвигается.
+Сводка до 6000 символов: начало message до 300 символов, остаток — строка
+«ещё N, id A–B»; после доставки позиция продвигается и за эти строки.
+При сбое SSH/tpanel позиция сохраняется для повтора. Если доставка уже произошла,
+но запись позиции не удалась или процесс оборвался, следующая попытка может
+повторить сводку.
+
+Вкладка задаётся через `Environment=ALERTS_TAB=…` в override сервиса
+(`sudo systemctl edit alerts-tab-forwarder.service`). Для обновления скрипта
+достаточно повторить install; при изменении юнитов выполнить daemon-reload.
+Остановка: `sudo systemctl disable --now alerts-tab-forwarder.timer`;
+уже запущенный проход завершится. Позицию при обновлении/откате сохранять.
+
+После каждого успешного ExecStart, включая пустой проход, ExecStartPost от root
+атомарно обновляет `/var/lib/prometheus/node-exporter/alerts_tab_forwarder.prom`
+(0644). Метрика `alerts_tab_forwarder_last_success_timestamp_seconds` — Unix-время
+последнего успеха; устаревание более пяти минут означает пропавший пульс.
+Сбой прохода оставляет прежний пульс. Пустые проходы молчат, работа даёт один
+JSON-итог с числом, диапазоном id и длительностью; ошибка — ERROR с этапом и
+безопасной причиной. Версия в журнале — первые 12 символов SHA256 скрипта.

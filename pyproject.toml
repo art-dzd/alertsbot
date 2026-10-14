@@ -8,7 +8,8 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.mypy]
 python_version = "3.10"
 strict = true
-files = ["alertsbot", "tests"]
+files = ["alertsbot", "tests", "scripts/tab_forwarder.py"]
+explicit_package_bases = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
