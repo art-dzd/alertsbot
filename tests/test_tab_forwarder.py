@@ -41,6 +41,7 @@ class Commands:
         self.ssh_code = 0
         self.ssh_codes: list[int] = []
         self.reset = False
+        self.public_ok = True
         self.now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
         self.tpanel_code = 0
         self.calls: list[list[str]] = []
@@ -84,6 +85,14 @@ def commands(monkeypatch: MonkeyPatch, tmp_path: Path) -> Commands:
     monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
     monkeypatch.delenv("ALERTS_TAB", raising=False)
     monkeypatch.setattr(tab_forwarder, "datetime", Clock)
+
+    def public_readyz(url: str, timeout: float) -> io.BytesIO:
+        assert url == tab_forwarder.PUBLIC_READYZ
+        if not fake.public_ok:
+            raise OSError("public path down")
+        return io.BytesIO()
+
+    monkeypatch.setattr("urllib.request.urlopen", public_readyz)
     monkeypatch.setattr(subprocess, "run", fake.run)
     return fake
 
@@ -342,7 +351,7 @@ def test_channel_outage_reported_once_and_recovery(
     commands.now = commands.now.replace(minute=3)
     assert tab_forwarder.main() != 0
     assert len(commands.messages) == 1
-    assert "alertsbot не готов" in commands.messages[0]
+    assert "не готов (readyz)" in commands.messages[0]
     assert "14.10 15:00 МСК" in commands.messages[0]
 
     commands.now = commands.now.replace(minute=10)
@@ -378,3 +387,24 @@ def test_broken_outage_file_does_not_block_delivery(commands: Commands, tmp_path
     assert tab_forwarder.main() == 0
     assert len(commands.messages) == 1
     assert not (tmp_path / "outage").exists()
+
+
+def test_public_path_outage_reported_while_history_still_delivered(
+    commands: Commands, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.public_ok = False
+    commands.rows = [alert(11)]
+    assert tab_forwarder.main() == 0
+    assert len(commands.messages) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == "public_unreachable"
+
+    commands.rows = []
+    commands.now = commands.now.replace(minute=3)
+    assert tab_forwarder.main() == 0
+    assert "недоступен снаружи" in commands.messages[1]
+
+    commands.public_ok = True
+    assert tab_forwarder.main() == 0
+    assert "снова доступен" in commands.messages[2]
+    capsys.readouterr()

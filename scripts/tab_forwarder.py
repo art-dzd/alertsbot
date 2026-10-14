@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypedDict, cast
@@ -21,9 +22,12 @@ PENDING_MAX_AGE = timedelta(minutes=5)
 MESSAGE_PREVIEW_LIMIT = 300
 MESSAGE_LIMIT = 6000
 MOSCOW = timezone(timedelta(hours=3))
-# Худший проход: два ssh-маршрута и tpanel укладываются в TimeoutStartSec=55s юнита.
+# Худший проход (два ssh-маршрута, внешний readyz, два tpanel) укладывается в TimeoutStartSec=90s.
 SSH_TIMEOUT_SECONDS = 15
+PUBLIC_TIMEOUT_SECONDS = 10
 TPANEL_TIMEOUT_SECONDS = 20
+# Этим путём шлют vpn, hr, gitea; его поломку при живом alertsbot иначе не видит никто.
+PUBLIC_READYZ = "https://aiomc.ru/alerts/readyz"
 OUTAGE_REPORT_AFTER = timedelta(minutes=3)
 SSH_UNREACHABLE = 255
 ALERTSBOT_NOT_READY = 3
@@ -185,10 +189,18 @@ def say(text: str) -> None:
 def outage_problem(error: Exception) -> str:
     code = error.returncode if isinstance(error, subprocess.CalledProcessError) else None
     if code == ALERTSBOT_NOT_READY:
-        return "alertsbot не готов (readyz)"
+        return "alertsbot на mts не готов (readyz) — алерты не принимаются"
     if code == SSH_UNREACHABLE or isinstance(error, subprocess.TimeoutExpired):
-        return "mts недоступен по ssh"
-    return "история alertsbot не читается"
+        return "mts недоступен по ssh — новые алерты сюда не доходят"
+    return "история alertsbot не читается — новые алерты сюда не доходят"
+
+
+def public_problem() -> str | None:
+    try:
+        urllib.request.urlopen(PUBLIC_READYZ, timeout=PUBLIC_TIMEOUT_SECONDS).close()
+    except (OSError, ValueError):
+        return "alertsbot недоступен снаружи (aiomc.ru/alerts) — алерты vpn, hr, gitea теряются"
+    return None
 
 
 def read_outage(path: Path) -> dict[str, Any] | None:
@@ -210,10 +222,7 @@ def note_outage(path: Path, problem: str) -> None:
     now = datetime.now(timezone.utc)
     outage = read_outage(path) or {"since": now.isoformat(), "reported": False}
     if not outage["reported"] and now - parse_time(outage["since"]) >= OUTAGE_REPORT_AFTER:
-        say(
-            f"Канал алертов: {problem} с {moscow_time(outage['since'])} МСК. "
-            "Новые алерты сюда не доходят, в Telegram — только если alertsbot жив."
-        )
+        say(f"Канал алертов: {problem}. Сбой с {moscow_time(outage['since'])} МСК.")
         outage["reported"] = True
     write_atomic(path, json.dumps(outage))
 
@@ -285,8 +294,13 @@ def main() -> int:
             stage = "ssh"
             raise
         ssh_ms = round((time.monotonic() - stage_started) * 1000, 3)
+        stage = "public"
+        problem = public_problem()
         stage = "outage"
-        end_outage(state_directory / "outage")
+        if problem:
+            note_outage(state_directory / "outage", problem)
+        else:
+            end_outage(state_directory / "outage")
         if last_id is None:
             stage = "state"
             stage_started = time.monotonic()
@@ -304,7 +318,11 @@ def main() -> int:
             return 0
 
         # Деградации пишутся и в пустом проходе: иначе их не видно.
-        reasons = ["history_reset"] * reset + ["ssh_via_vpn"] * (route_index > 0)
+        reasons = (
+            ["history_reset"] * reset
+            + ["ssh_via_vpn"] * (route_index > 0)
+            + ["public_unreachable"] * bool(problem)
+        )
         outcome = "fallback" if reasons else "ok"
         if reset:
             last_id = 0
