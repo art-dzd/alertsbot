@@ -1,55 +1,45 @@
 # Тестирование alertsbot
 
-## Текущее состояние
-В репозитории есть unit-тесты FastAPI-слоя и Telegram-клиента.
-Quality gate: `pytest`, `ruff`, `mypy`.
+Quality gate: pytest, ruff, mypy. Целевая версия Python 3.10 (prod/CI 3.10.12);
+локальный venv может быть новее. Новых зависимостей нет.
 
-## Локальные проверки перед деплоем
+Перед сдачей по запросу владельца — полный набор:
+
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
-pytest -q --tb=short
-ruff check .
-mypy alertsbot tests
+.venv/bin/python -m pytest -q --tb=short
+.venv/bin/python -m ruff check .
+.venv/bin/python -m mypy
 ```
 
-Проверка, что приложение поднимается:
-```bash
-uvicorn alertsbot.app:app --host 127.0.0.1 --port 9100
-curl -fsS http://127.0.0.1:9100/healthz
-curl -fsS http://127.0.0.1:9100/readyz
-```
+По ходу изменения — затронутые тесты. В CI текущий маленький набор является
+адресным набором общего пути выпуска: app → история/конфиг/Telegram/логи и
+проверка startup. Настройки ruff `py310`, mypy `3.10`.
 
-## Smoke-тест `/notify`
-Негативный кейс (неверный токен, ожидаем `401`):
-```bash
-curl -i -X POST http://127.0.0.1:9100/notify \
-  -H 'Content-Type: application/json' \
-  -H 'X-Alerts-Token: wrong-token' \
-  -d '{"service":"demo","title":"t","message":"m"}'
-```
+## Покрываемое поведение
 
-Позитивный кейс (валидный токен, ожидаем `200` и `{"status":"sent"}`):
-```bash
-curl -i -X POST http://127.0.0.1:9100/notify \
-  -H 'Content-Type: application/json' \
-  -H "X-Alerts-Token: ${ALERTS_TOKEN}" \
-  -d '{"service":"demo","title":"t","message":"m","details":"ok"}'
-```
+- Auth до JSON: неверный/отсутствующий заголовок и пустой настроенный секрет → 401,
+  без истории, отправки и разбора тела.
+- JSON-объекты с пропущенными/нестроковыми/длинными полями доставляются с WARNING;
+  длинные event_id не склеиваются, полный текст сохраняется в истории.
+- Необъект/невалидный JSON → 422, WARNING и rejected без содержимого тела.
+- Настоящая временная SQLite: commit pending до Telegram, итог sent/failed после,
+  повтор отдельной строкой, 90-дневная ретенция и ограничение частоты чистки.
+- Отказ SQLite при записи/обновлении сохраняет доставку и даёт ERROR.
+- Telegram-заглушка проверяет URL и JSON sendMessage; ошибки 400/4xx/5xx/429,
+  прокси, breaker, повторные попытки и переиспользование клиентов.
+- event_id: последовательные/параллельные повторы, TTL, вытеснение, повтор после 502.
+- JSON-формат, безопасные ошибки, request_id, startup, ровно один notify_done,
+  отсутствие дублирующего access/успешных health-логов.
+- Post-check CI отклоняет отсутствие целевого startup, ERROR и не-JSON строки.
 
-## Критерии готовности к релизу
-- Приложение стартует без traceback.
-- `/healthz` отвечает успешно.
-- `/readyz` отвечает успешно при валидном конфиге.
-- `/notify` корректно разделяет `200`, `401`, `422`, `424`, `502`.
-- Telegram `429` ретраится один раз с ограниченной паузой.
-- Telegram `400` не ретраится и маппится в `422`.
-- Telegram `401/403/404` не ретраятся и маппятся в `424`.
-- Повтор `/notify` с тем же `event_id` не отправляет дубль до истечения TTL.
-- В `journalctl` нет новых необработанных исключений.
+Settings не читают `.env`/окружение машины: тестовая фикстура убирает ALERTS/прокси
+переменные и отключает env_file. БД изолированы в tmp_path; часы breaker/TTL/чистки
+подменены, паузы 429 заменены заглушкой. Реальной сети и sleep в тестах нет.
+Для новой логики сначала воспроизводится красный тест на старом поведении.
 
-## Долг по качеству
-- Добавить идемпотентность по `event_id` с TTL.
-- Добавить post-restart healthcheck в `scripts/restart.sh`.
+## Приёмка выпуска
+
+CI включает mypy, ruff и тесты. После рестарта проверяются health, active, неизменный
+InvocationID, JSON-журнал этого запуска: startup с целевым SHA и отсутствие ERROR.
+При отказе post-check срабатывает откат. Успешный pytest не доказывает выкладку.
+Внешний smoke /notify отправляет настоящее сообщение: выполнять только по разрешению.

@@ -39,6 +39,7 @@ class FakeResponse:
 
 
 class FakeAsyncClient:
+    expected_url = "https://api.telegram.org/bottoken/sendMessage"
     calls: list[str] = []
     outcomes: list[FakeOutcome] = []
     created_proxies: list[str] = []
@@ -66,6 +67,8 @@ class FakeAsyncClient:
         return None
 
     async def post(self, url: str, json: dict[str, Any]) -> FakeResponse:
+        assert url == self.expected_url
+        assert json == {"chat_id": "chat", "text": "text", "disable_web_page_preview": True}
         self.calls.append(self.proxy)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -84,6 +87,7 @@ def setup_fake_client(monkeypatch: MonkeyPatch, outcomes: list[FakeOutcome]) -> 
     FakeAsyncClient.created_proxies = []
     FakeAsyncClient.outcomes = outcomes
     monkeypatch.setattr("alertsbot.telegram.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("alertsbot.telegram.time.monotonic", lambda: 1000.0)
 
 
 def send_for_test(
@@ -91,17 +95,24 @@ def send_for_test(
     token: str = "token",
     client_pool: telegram.TelegramClientPool | None = None,
 ) -> str:
-    return asyncio.run(
-        telegram.send_message(
-            token,
-            "chat",
-            "text",
-            1.0,
-            proxy_urls,
-            60.0,
-            client_pool=client_pool,
-        ),
-    )
+    async def send() -> str:
+        pool = client_pool or telegram.TelegramClientPool(1.0)
+        FakeAsyncClient.expected_url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            return await telegram.send_message(
+                token,
+                "chat",
+                "text",
+                proxy_urls,
+                60.0,
+                client_pool=pool,
+                stats=telegram.DeliveryStats(),
+            )
+        finally:
+            if client_pool is None:
+                await pool.aclose()
+
+    return asyncio.run(send())
 
 
 def test_settings_prefers_proxy_url_list() -> None:
@@ -292,4 +303,7 @@ def test_send_message_logs_http_status_without_bot_token(
             send_for_test(("http://primary:8888",), token=secret_token)
 
     assert secret_token not in caplog.text
-    assert "HTTPStatusError status=502" in caplog.text
+    retries = [r for r in caplog.records if getattr(r, "event", None) == "telegram_retry"]
+    assert len(retries) == 1
+    assert vars(retries[0])["fields"]["status"] == 502
+    assert vars(retries[0])["fields"]["error_code"] == 502

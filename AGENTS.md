@@ -1,64 +1,82 @@
-# Индекс документации alertsbot
+# alertsbot
 
-Индексный файл проекта `alertsbot`.
-Подробные регламенты и runbook вынесены в `docs/`.
+Небольшой FastAPI-сервис на `mts`: принимает `POST /notify`, проверяет
+`X-Alerts-Token`, сохраняет историю и синхронно отправляет сообщение в Telegram.
+Python 3.10+, stdlib SQLite, существующие FastAPI/httpx/pydantic. Один воркер.
 
-## Кратко о проекте
-- `alertsbot` принимает HTTP-уведомления от внутренних сервисов.
-- Проверяет общий секрет в заголовке `X-Alerts-Token`.
-- Пересылает сообщение в Telegram через Bot API.
-- Не хранит состояние и не содержит бизнес-логику.
+## Правила
 
-## Стек
-- Python 3.11+, FastAPI, Uvicorn.
-- `httpx` для исходящего запроса в Telegram API.
-- `pydantic`/`pydantic-settings` для модели и конфигурации.
-- `systemd`-юнит + `scripts/restart.sh` для эксплуатации.
+- Общаться по-русски. Минимальные изменения, без новых зависимостей и очередей.
+- До работы читать скиллы `lean-code`, `logging`, `testing`.
+- Работать в `main`; коммитить только свои файлы, сообщения коммитов по-русски.
+- Push в `main` автоматически выкладывает на прод: только с разрешения владельца.
+- Реальные сообщения в Telegram, SSH и изменения продового `.env` — только по разрешению.
+- Секреты, тела отклонённых запросов и тексты исключений не выводить в журнал.
+- Разовые отчёты и выгрузки держать в `/tmp`, в `docs/` — рабочая документация.
 
-## Принципы работы
-1. Любой `POST /notify` сначала проходит авторизацию по `X-Alerts-Token`.
-2. Конфигурация приходит только из `.env`/переменных окружения.
-3. Сообщение формируется в предсказуемом текстовом формате.
-4. Сбой Telegram не скрывается: логируется и отдаётся как `HTTP 502`.
-5. Простота и прозрачность важнее усложнений (очередей/ретраев внутри сервиса нет).
+## Контракт
 
-## Каноническая документация
+Авторизация идёт до чтения тела. Любой JSON-объект нормализуется и отправляется:
+пропущенные поля заменяются заглушками, нестроковые приводятся к JSON-строке,
+длинные обрезаются для Telegram. Полный текст остаётся в истории.
+Необъект/невалидный JSON получает `422` и строку `rejected`; неверный токен — `401`
+без записи истории. Telegram: успех `200 sent`, payload `422`, постоянный сбой
+`424`, временный `502` для повторов клиента. Доставка остаётся внутри запроса.
 
-### Основная
-- `docs/architecture.md` — компоненты, стек, модули, data flow, конфигурация, запуск.
-- `docs/deploy.md` — запуск, systemd-деплой, post-check и rollback.
-- `docs/testing.md` — текущий quality gate и smoke-сценарии.
-- `docs/commands.md` — рабочие команды разработки и эксплуатации.
-- `docs/design/notify-flow.md` — контракт запроса и инварианты форматирования.
+Кэш `event_id`: один час, максимум 10 000 событий; успех и постоянные ошибки
+повторяются без отправки, `502` не кэшируется. Кэш живёт до рестарта.
+Каждый авторизованный запрос, включая повтор, получает отдельную строку истории.
+Сбой SQLite логируется как ERROR и не мешает отправке.
 
-### Ревью и аудиты
-- `docs/quality-score.md` — сводная оценка проекта (5/10) и топ-5 приоритетных действий.
-- `docs/code-review.md` — code review: баги, error handling, race conditions (оценка 7.5/10).
-- `docs/architecture-review.md` — архитектурная оценка по 7 критериям (оценка 7.3/10).
-- `docs/security-review.md` — security audit: OWASP Top 10, CVE, auth, валидация.
-- `docs/dependency-audit.md` — аудит зависимостей: версии, CVE, пиннинг, устаревание.
-- `docs/ci-review.md` — ревью CI/CD: текущее состояние и дорожная карта.
-- `docs/test-gaps.md` — анализ тестового покрытия и приоритетный план написания тестов.
-- `docs/simplifier-report.md` — что можно упростить: мёртвый код, дублирование, комментарии.
+## Эксплуатация
 
-## Ограничения
-- Без валидного `ALERTS_TOKEN` отправка запрещена.
-- Сервис не делает дедупликацию и повторные отправки.
-- Изменение контракта `/notify` требует синхронного обновления документации.
-- В проде нельзя запускать сервис без `.env` с заполненными секретами.
+Прод: `/alertsbot`, пользователь/юнит `alertsbot`. systemd создаёт
+`/var/lib/alertsbot` с правами `0700`; история по умолчанию —
+`/var/lib/alertsbot/alerts.db` (`ALERTS_DB_PATH`). Хранение 90 дней, чистка при
+старте и на запросах не чаще раза в час. `pending` означает незавершённую обработку,
+`sent` — успех, `failed` — сбой, `rejected` — отклонённое тело.
 
-## Базовые команды
+Логи: JSON в stdout → journald. Читать:
+
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-uvicorn alertsbot.app:app --host 0.0.0.0 --port 9100
+journalctl -u alertsbot -n 100 --no-pager -o cat
+journalctl -u alertsbot -f -o cat
 ```
 
-## Минимальный деплойный контур
-- Подготовить/обновить `.env` на сервере.
-- Выполнить `bash scripts/restart.sh` в каталоге проекта.
-- Проверить `systemctl status alertsbot`, `healthz` и `journalctl`.
+Последние 20 алертов, включая текст (SQLite CLI не нужен):
 
-## SSH
-- Серверы подключаются через короткие алиасы из `~/.ssh/config`; актуальный список смотри командой `grep -E '^Host ' ~/.ssh/config`.
+```bash
+sudo -u alertsbot python3 - <<'PY'
+import json
+import sqlite3
+from contextlib import closing
+with closing(sqlite3.connect('file:/var/lib/alertsbot/alerts.db?mode=ro', uri=True)) as db:
+    db.row_factory = sqlite3.Row
+    for row in db.execute('SELECT * FROM alerts ORDER BY created_at DESC, id DESC LIMIT 20'):
+        print(json.dumps(dict(row), ensure_ascii=False))
+PY
+```
+
+Health: `curl -fsS http://127.0.0.1:9100/healthz` — живость;
+`curl -fsS http://127.0.0.1:9100/readyz` — конфигурация и доступность истории.
+Telegram health не вызывает. Метрик ресурсов внутри сервиса нет: их собирают на хосте.
+Сервис сам себе алерты не отправляет; сбои доставки/истории видны в ERROR и истории.
+Journald должен сохранять рабочие логи минимум 14 дней; политика задаётся на хосте.
+
+## Документация и проверки
+
+- [Архитектура](docs/architecture.md)
+- [Контракт /notify](docs/design/notify-flow.md)
+- [Тестирование](docs/testing.md)
+- [Деплой и откат](docs/deploy.md)
+- [Команды](docs/commands.md)
+
+```bash
+.venv/bin/python -m pytest -q --tb=short
+.venv/bin/python -m ruff check .
+.venv/bin/python -m mypy
+```
+
+Системный юнит: `systemd/alertsbot.service`. Канонический выпуск — Gitea CI;
+`bash scripts/restart.sh` — резервный путь. После рестарта обязательны health,
+`startup` с SHA выпуска и отсутствие ERROR нового запуска.

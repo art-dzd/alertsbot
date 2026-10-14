@@ -1,75 +1,60 @@
 # Деплой alertsbot
 
-## Способ деплоя
+Канонический путь — push в main: Gitea Actions проверяет ruff, mypy и тесты,
+затем автоматически выкладывает на mts. Прод: `/alertsbot`, пользователь/юнит
+`alertsbot`, Python 3.10.12, runner на том же хосте. Push требует разрешения владельца.
 
-Канонический путь — **push в `main`**: Gitea Actions (`.gitea/workflows/ci-deploy.yml`)
-прогоняет ruff + pytest и автоматически деплоит на прод.
-Прод — хост `mts`, каталог `/alertsbot`, systemd-юнит `alertsbot`, runner живёт на самом хосте.
-Docker-контейнеров и миграций БД нет — проект stateless.
+## Выпуск
 
-Руками на проде — только верификация. `scripts/restart.sh` — резервный путь
-на случай недоступности CI; не катать руками поверх работающего CI (гонка).
+CI держит отдельный venv и под flock выполняет:
 
-## Что делает CI-деплой
+1. Запоминает предыдущий SHA, устанавливает целевой git HEAD и зависимости.
+2. Копирует systemd-юнит, daemon-reload, restart.
+3. Запоминает InvocationID нового запуска, проверяет health (до 10 попыток), active
+   и отсутствие перезапуска между проверками.
+4. Читает только журнал нового InvocationID. `scripts/check_startup.py` требует
+   корректный JSON, `startup` с целевой версией и отсутствие ERROR/CRITICAL.
+   Версия в приложении и CI — `git rev-parse --short=12 HEAD`.
+5. Любой сбой вызывает существующий откат: предыдущий git HEAD, зависимости/юнит,
+   daemon-reload, restart и healthcheck. Журнал выводится при провале job.
 
-1. Job `ci`: `ruff check` + `pytest` в отдельном CI-venv на runner'е.
-2. Job `deploy` (только после зелёного `ci`, под flock):
-   `git reset --hard` на SHA пуша → `pip install -r requirements.txt` →
-   установка systemd-юнита из `systemd/alertsbot.service` → `daemon-reload` →
-   `restart` → healthcheck (до 10 попыток). При сбое — автоматический откат
-   на предыдущий SHA с тем же циклом.
+## Данные и настройки
 
-## Что нужно заранее (новый хост)
+`.env` уже содержит заполненные секреты и `ALERTS_APP_HOST`/`ALERTS_APP_PORT` для
+uvicorn. Settings host/port не читает. Продовый `.env` не изменяется при выкладке.
+`ALERTS_ENV=prod` запрещает старт с пустыми/placeholder секретами.
 
-- Linux-хост с `systemd` и доступом в интернет к Telegram API (или настроенный `TELEGRAM_PROXY_URL`).
-- Python 3.11+ и `python3-venv`.
-- Заполненный `.env` на основе `.env.example`.
+Новый юнит: `StateDirectory=alertsbot`, `StateDirectoryMode=0700`, `UMask=0077`.
+systemd создаёт `/var/lib/alertsbot` для пользователя alertsbot. По умолчанию
+`ALERTS_DB_PATH=/var/lib/alertsbot/alerts.db`; если `.env` задаёт путь, он имеет
+приоритет над Environment юнита и должен быть доступен пользователю alertsbot.
+На существующем хосте добавлять настройку в `.env` для стандартного пути не требуется.
+Схема SQLite создаётся приложением при первом доступе, без отдельного мигратора.
+Данные хранятся 90 дней и переживают git reset/деплой/откат.
 
-## Первый запуск вручную
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn alertsbot.app:app --host 0.0.0.0 --port 9100
-```
-
-## Резервный ручной деплой (systemd)
-
-`scripts/restart.sh`:
-1. Создаёт/обновляет `.venv` и зависимости.
-2. Копирует `systemd/alertsbot.service` в `/etc/systemd/system/`.
-3. Выполняет `daemon-reload`, `enable`, `restart`.
-
-```bash
-cd /alertsbot
-bash scripts/restart.sh
-```
-
-## Проверки после деплоя (на проде)
+## Проверки на хосте
 
 ```bash
 systemctl status alertsbot --no-pager
 curl -fsS http://127.0.0.1:9100/healthz
 curl -fsS http://127.0.0.1:9100/readyz
-journalctl -u alertsbot -n 100 --no-pager
+journalctl -u alertsbot -n 100 --no-pager -o cat
 diff /etc/systemd/system/alertsbot.service /alertsbot/systemd/alertsbot.service
 ```
 
-Ожидаемое состояние:
-- юнит `alertsbot` в статусе `active (running)`;
-- `/healthz` отвечает `{"status":"ok"}`, `/readyz` — `{"status":"ready"}`;
-- установленный юнит совпадает с юнитом в репозитории;
-- в логах нет повторяющихся ошибок Telegram/авторизации.
+Живость: `healthz` → ok. Готовность: `readyz` → ready (конфиг и БД; не Telegram).
+Обязательно startup с SHA выпуска, отсутствие ERROR нового запуска, установленный
+юнит совпадает с репо. Чтение последних алертов через python3+sqlite3 — [AGENTS.md](../AGENTS.md).
+Политика journald на хосте должна хранить JSON-логи минимум 14 дней; репо её не меняет.
 
-## Обновление
+## Резервный путь и откат
 
-- Запушить в `main`, дождаться зелёного CI.
-- Выполнить post-check из раздела выше.
+`bash scripts/restart.sh` создаёт/обновляет venv, устанавливает юнит и рестартит
+сервис. Это резервный путь при недоступном CI, без параллельной выкладки.
+После него те же post-check обязательны вручную.
 
-## Откат
-
-- При неудачном healthcheck CI откатывается сам на предыдущий SHA.
-- Ручной откат: `sudo -u alertsbot git -C /alertsbot reset --hard <SHA>`,
-  затем `bash scripts/restart.sh` и post-check.
+Ручной откат по разрешению: `sudo -u alertsbot git -C /alertsbot reset --hard <SHA>`,
+затем `bash scripts/restart.sh` и post-check. SQLite не удалять: старый код может
+не читать историю, но файл останется для последующего обновления/разбора.
+Автоматический откат проверяет health, а ручная проверка журнала отката остаётся
+за оператором (старые выпуски могут писать прежний формат).

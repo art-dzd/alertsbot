@@ -46,4 +46,10 @@ python -m compileall alertsbot
 
 ## Lint / Build
 
-В проекте нет линтера, форматтера или этапа сборки. Минимальный quality gate — `python -m compileall alertsbot` (см. выше).
+```bash
+.venv/bin/python -m pytest -q --tb=short
+.venv/bin/python -m ruff check .
+.venv/bin/python -m mypy
+```
+
+История, JSON-журнал и команды их чтения: [AGENTS.md](../AGENTS.md).

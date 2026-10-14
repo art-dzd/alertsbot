@@ -1,186 +1,111 @@
 # Архитектура alertsbot
 
-## Назначение
+Python 3.10+, FastAPI/Uvicorn, httpx, pydantic-settings, SQLite из стандартной
+библиотеки. Один процесс/воркер systemd, без очереди и новых зависимостей.
 
-`alertsbot` — минимальный HTTP-сервис, который принимает уведомления от внутренних приложений и пересылает их в Telegram-чат.
-Сервис сознательно без бизнес-логики: только авторизация, форматирование текста и доставка в Telegram Bot API.
-Состояние не хранит долговечно и очереди нет.
-Есть только in-memory идемпотентность по `event_id` с TTL для одного воркера и ограниченные повторы для временных ошибок Telegram/сети.
+## Модули
 
-## Стек технологий
+| Модуль | Назначение |
+|---|---|
+| `app.py` | Авторизация до разбора тела, нормализация, API, форматирование, кэш event_id |
+| `config.py` | Settings из `.env`/окружения, числовые ограничения через Field |
+| `telegram.py` | Обязательный пул httpx-клиентов, прокси, ограниченные повторы, breaker |
+| `history.py` | SQLite: запись до отправки, итоговый статус, ретенция |
+| `logging.py` | JSON stdout, UTC, версия из git HEAD, request_id, безопасные стеки |
 
-| Компонент       | Версия / библиотека          |
-|-----------------|------------------------------|
-| Язык            | Python 3.11+                 |
-| Web-фреймворк   | FastAPI                      |
-| ASGI-сервер     | Uvicorn (с `standard`-extras)|
-| HTTP-клиент     | httpx                        |
-| Валидация       | pydantic 2.x                 |
-| Конфигурация    | pydantic-settings            |
-| Процесс-менеджер| systemd                      |
+## Поток
 
-## Модули и их роли
+1. Проверить `X-Alerts-Token`; при отказе `401`, WARNING, без чтения тела и истории.
+2. Разобрать JSON. Необъект/невалидный JSON: `422`, история `rejected`, WARNING без тела.
+3. Нормализовать поля JSON-объекта. Полный нормализованный текст сохранить в SQLite
+   с UTC-временем, клиентом, event_id и статусом `pending`; commit до Telegram.
+4. Для event_id взять lock и проверить кэш. Повтор возвращает прежний результат
+   без отправки, его новая строка истории имеет `cached=1`.
+5. Через lifespan-пул синхронно в HTTP-запросе отправить Telegram, ограничив текст.
+6. Обновить историю: `sent`/`failed`, HTTP- и Telegram-статусы, безопасная причина,
+   время успешной доставки. Для повтора время доставки берётся из кэша.
+7. Ровно один `notify_done` с результатом и длительностями, затем ответ клиенту.
 
-| Модуль                  | Роль                                                                            |
-|-------------------------|---------------------------------------------------------------------------------|
-| `alertsbot/app.py`      | FastAPI-приложение: модель `NotifyRequest`, маршруты `/healthz` и `/notify`, авторизация и форматирование текста. |
-| `alertsbot/config.py`   | Загрузка настроек из `.env` / переменных окружения через `pydantic-settings` (`Settings`, `get_settings()`). |
-| `alertsbot/telegram.py` | Асинхронный `httpx`-клиент для `sendMessage` в Telegram Bot API (переиспользуемый client pool, опциональный прокси, `trust_env=False`). |
-| `alertsbot/__init__.py`  | Пустой пакетный init.                                                           |
+Сбой любой операции SQLite: ERROR `history_error`, отправка и ответы Telegram
+сохраняются. Успешная доставка при отказе истории — WARNING `fallback`.
+`pending` после аварийного завершения остаётся видимым: это не доказательство доставки.
+История не переотправляет записи автоматически. При отказе диска наличие записи
+истории гарантировать нельзя; доступность доставки имеет приоритет.
 
-## Зависимости между модулями
+## API
 
-```
- ┌──────────────┐
- │   app.py     │  ← точка входа (FastAPI)
- │  /healthz    │
- │  /notify     │
- └──┬───────┬───┘
-    │       │
-    │ import│ import
-    ▼       ▼
-┌────────┐ ┌──────────────┐
-│config.py│ │ telegram.py  │
-│Settings │ │ send_message │
-└────────┘ └──────────────┘
-     ▲              │
-     │              │ httpx.AsyncClient
-     │              ▼
-     │     ┌──────────────────┐
-     │     │ Telegram Bot API │
-     │     └──────────────────┘
-  .env / ENV
-```
+- `GET /healthz` и `/health`: `200 {"status":"ok"}` — живость.
+- `GET /readyz`: `200 {"status":"ready"}` — валидный стартовый конфиг и доступная
+  SQLite; при отказе истории `503`. Telegram не вызывается.
+- `POST /notify`: [полный контракт](design/notify-flow.md).
+- В prod `/docs`, `/redoc`, `/openapi.json` выключены.
 
-- `app.py` импортирует `config.get_settings()` и `telegram.send_message()`.
-- `config.py` и `telegram.py` независимы друг от друга.
-- `telegram.py` не знает о конфигурации — получает параметры через аргументы.
+## История
 
-## Точки входа (API endpoints)
+Путь `ALERTS_DB_PATH`, локально `alerts.db`, в systemd
+`/var/lib/alertsbot/alerts.db`. systemd `StateDirectory=alertsbot`, владелец
+`alertsbot`, каталог `0700`, `UMask=0077`. Деплой/откат историю не удаляет.
 
-| Метод  | Путь       | Авторизация       | Описание                        |
-|--------|------------|-------------------|---------------------------------|
-| `GET`  | `/healthz` | нет               | Liveness-проверка. Возвращает `{"status":"ok"}`. |
-| `GET`  | `/readyz`  | нет               | Readiness-проверка валидного runtime-конфига. |
-| `POST` | `/notify`  | `X-Alerts-Token`  | Приём уведомления и отправка в Telegram. |
+Таблица `alerts`: `id`, `created_at` (UTC ISO 8601), `service`, `title`, `message`,
+`details`, `event_id`, `client`, `status`, `http_status`, `telegram_status`, `reason`,
+`sent_at`, `cached`. Индекс `alerts_created_at`. Текст сохраняется полностью;
+в rejected нет содержимого тела. event_id в БД полный, ключ кэша — SHA-256 полного
+идентификатора. Длинный event_id в журнале показан как `sha256:<digest>`.
 
-### POST /notify — контракт
+Хранение 90 дней: DELETE при старте и при приёме запросов не чаще раза в час.
+SQLite-файл может сохранять свободные страницы после DELETE; они переиспользуются.
+Записи синхронные, с ограниченным ожиданием блокировки (0,1 с); рассчитано на
+маленький поток ~15 отправителей, не на массовую очередь.
 
-**Заголовок:** `X-Alerts-Token: <ALERTS_TOKEN>`
+## Доставка и идемпотентность
 
-**Тело (JSON):**
+Текст без parse_mode: service, title, message, опционально details через пустую
+строку. Поля и итоговый текст обрезаются, итог максимум 4096 символов.
+Кэш: TTL 3600 секунд, 10 000 записей, вытеснение старейших. Кэшируются `200`,
+`422` Telegram и `424`; `502` не кэшируется. Рестарт сбрасывает кэш и breaker.
+Одновременные запросы одного event_id сериализуются.
 
-| Поле      | Тип    | Обязательное | Описание                 |
-|-----------|--------|:------------:|--------------------------|
-| `service` | string | да           | Название сервиса         |
-| `title`   | string | да           | Заголовок уведомления    |
-| `message` | string | да           | Основной текст           |
-| `details` | string | нет          | Дополнительные детали    |
-| `event_id`| string | нет          | Идемпотентный ключ события |
+Прокси идут в заданном порядке, нездоровые — последними. На последнем прокси
+до двух попыток. `429` повторяется один раз с retry_after, максимум 10 секунд.
+Только транспортные ошибки/таймауты помечают прокси нездоровым; `5xx` Telegram — нет.
+Клиенты переиспользуются через lifespan, `trust_env=False`, лимиты соединений 20/10.
 
-**Ответы:**
+## Настройки
 
-| Код  | Тело                            | Когда                              |
-|------|---------------------------------|------------------------------------|
-| 200  | `{"status":"sent"}`                         | Сообщение успешно отправлено |
-| 401  | `{"detail":"Unauthorized"}`                 | Токен отсутствует или не совпал |
-| 422  | `{"detail":"Telegram payload rejected"}`    | Telegram отклонил payload, например `400 Bad Request` |
-| 424  | `{"detail":"Permanent Telegram error"}`     | Постоянная ошибка доступа/конфига Telegram: `401/403/404` |
-| 502  | `{"detail":"Temporary Telegram error"}`     | Временная ошибка Telegram/сети после ограниченных повторов |
+| Переменная | Значение по умолчанию |
+|---|---|
+| `ALERTS_ENV` | `dev` |
+| `ALERTS_BOT_TOKEN`, `ALERTS_CHAT_ID`, `ALERTS_TOKEN` | пусто; в prod обязательно заполнить |
+| `ALERTS_DB_PATH` | `alerts.db`; systemd задаёт `/var/lib/alertsbot/alerts.db` |
+| `ALERTS_LOG_LEVEL` | `INFO` |
+| `ALERTS_REQUEST_TIMEOUT_SECONDS` | `10`, конечное число > 0 |
+| `TELEGRAM_PROXY_URLS` | пусто; список через запятую имеет приоритет |
+| `TELEGRAM_PROXY_URL` | пусто; обратная совместимость, иначе direct |
+| `TELEGRAM_PROXY_CIRCUIT_BREAKER_SECONDS` | `120`, конечное число >= 0 |
 
-## Data flow
+`ALERTS_APP_HOST`/`ALERTS_APP_PORT` остаются переменными systemd для uvicorn;
+Settings их не читает. Пустые/placeholder секреты в prod запрещают старт.
 
-```
-Клиент (внутренний сервис)
-   │
-   │  POST /notify  {service, title, message, details?}
-   │  Header: X-Alerts-Token
-   ▼
-┌──────────────────────────────────────────────────┐
-│  app.py                                          │
-│  1. Проверить X-Alerts-Token == ALERTS_TOKEN     │
-│     └─ нет → 401 Unauthorized                    │
-│  2. Собрать текст:                               │
-│     "{service}\n{title}\n{message}"              │
-│     + "\n\n{details}" если передан               │
-│  3. Вызвать send_message(token, chat_id, text,   │
-│                          timeout, proxy_url)      │
-│     ├─ Telegram 400 → лог + 422                  │
-│     ├─ Telegram 401/403/404 → лог + 424          │
-│     └─ временная ошибка/429 → лог + 502          │
-│  4. Вернуть {"status":"sent"}                    │
-└──────────────────────────────────────────────────┘
-   │
-   │  httpx POST (async, trust_env=False)
-   │  опционально через TELEGRAM_PROXY_URL
-   ▼
-┌──────────────────────────────────────────────────┐
-│  Telegram Bot API                                │
-│  POST /bot<TOKEN>/sendMessage                    │
-│  {chat_id, text, disable_web_page_preview: true} │
-└──────────────────────────────────────────────────┘
-   │
-   ▼
-  Telegram-чат (ALERTS_CHAT_ID)
-```
+## Журнал
 
-## Конфигурация (env)
+Одна JSON-строка в stdout: `ts`, `level`, `service=alertsbot`, `version`, `event`,
+`message`, `code`, `request_id`. Версия — `git rev-parse --short=12 HEAD` в каталоге
+клона при загрузке модуля; неизвестная версия даёт ERROR и не проходит CI post-check.
+`startup` пишется при старте после подготовки истории.
 
-Все настройки читаются из `.env` или переменных окружения (см. `.env.example`).
+`notify_done`: `outcome`, `reason`, `history_id`, `event_id`, `alert_service`,
+`alert_title`, `client`, `method`, `route`, `http_status`, `duration_ms`, `telegram_ms`,
+`proxy`, `attempts`, `cached`, `telegram_status`, `error_code`, `exception_type`.
+`request_id` берётся из безопасного X-Request-ID (ASCII, до 128 символов), иначе
+генерируется; возвращается в заголовке ответа. Тексты message/details в общий журнал
+не попадают. Настроенные токены маскируются, credentials прокси не выводятся.
 
-| Переменная                       | По умолчанию | Описание                                    |
-|----------------------------------|:------------:|---------------------------------------------|
-| `ALERTS_BOT_TOKEN`               | —            | Токен Telegram-бота                         |
-| `ALERTS_CHAT_ID`                 | —            | Целевой чат/канал                           |
-| `ALERTS_TOKEN`                   | —            | Общий секрет для клиентов `/notify`         |
-| `ALERTS_APP_HOST`                | `0.0.0.0`   | Host для uvicorn                            |
-| `ALERTS_APP_PORT`                | `9100`       | Порт для uvicorn                            |
-| `ALERTS_LOG_LEVEL`               | `INFO`       | Уровень логирования                         |
-| `ALERTS_REQUEST_TIMEOUT_SECONDS` | `10.0`       | Timeout исходящего запроса в Telegram (сек)  |
-| `TELEGRAM_PROXY_URL`             | `""`         | HTTP/SOCKS-прокси для Telegram API (опционально) |
+Успех/повтор — INFO, нормализация/ретрай/отказ тела или авторизации — WARNING,
+сбой доставки — ERROR. Ошибка доставки имеет приоритет над `fallback` нормализации.
+Каждая реальная повторная попытка даёт `telegram_retry`: номер, время, статус,
+error_code, безопасный прокси. Финальный сбой отражается в `notify_done`.
+Тексты исключений/ответов не выводятся; стек содержит только места в коде.
+Uvicorn access выключен в юните; фильтр приложения подавляет /notify и успешные health.
+Сторонние логи — от WARNING, тоже JSON, без их потенциально опасного текста.
 
-В `prod`/`production` окружении сервис падает при старте, если `ALERTS_BOT_TOKEN`, `ALERTS_CHAT_ID` или `ALERTS_TOKEN` пустые либо равны placeholder-значениям вроде `replace_me`.
-`ALERTS_REQUEST_TIMEOUT_SECONDS` должен быть больше `0`, `TELEGRAM_PROXY_CIRCUIT_BREAKER_SECONDS` — не меньше `0`.
-
-## Запуск
-
-### Локально (dev)
-```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env        # заполнить секреты
-uvicorn alertsbot.app:app --host 0.0.0.0 --port 9100
-```
-
-### Продакшн (systemd)
-
-Юнит: `systemd/alertsbot.service` — запускает uvicorn с параметрами из `.env`.
-
-```
-WorkingDirectory=/alertsbot
-EnvironmentFile=/alertsbot/.env
-ExecStart=/alertsbot/.venv/bin/uvicorn alertsbot.app:app --host ${ALERTS_APP_HOST} --port ${ALERTS_APP_PORT} --workers 1
-Restart=always, RestartSec=5
-```
-
-Деплой одной командой:
-```bash
-bash scripts/restart.sh
-```
-
-`restart.sh` создаёт/обновляет `.venv`, ставит зависимости, копирует юнит в systemd, делает `daemon-reload` → `enable` → `restart`.
-
-## Наблюдаемость и ограничения
-
-- Логи через стандартный `logging` (`logger = logging.getLogger("alertsbot")`), уровень задаётся через `ALERTS_LOG_LEVEL`.
-- Повторные отправки не дедуплицируются — идемпотентность на стороне клиента.
-- Очереди нет: при долгой недоступности Telegram клиент получает `502`.
-- `429` ретраится один раз с паузой по `retry_after`, но пауза жёстко ограничена.
-- Proxy breaker банит только транспортные ошибки/таймауты; Telegram `5xx` не помечает proxy нездоровым.
-- `/healthz` показывает живость процесса, `/readyz` — готовность конфигурации после fail-fast валидации.
-- `event_id` дедуплицируется только в памяти процесса и только до истечения TTL; это не durable-очередь.
-- Кэшируются только успех и постоянные ошибки (`422`/`424`); временный `502` не кэшируется, повтор с тем же `event_id` отправляет заново.
-- Размер кэша `event_id` ограничен (`IDEMPOTENCY_MAX_RECORDS`), старые записи вытесняются.
-- Сервис рассчитан ровно на один воркер uvicorn (`--workers 1` в systemd-юните): breaker и идемпотентность — in-memory.
-- Telegram HTTP-клиенты переиспользуются через FastAPI lifespan с лимитами соединений.
-- Docker не используется — только systemd.
+Чтение истории/журнала — в [AGENTS.md](../AGENTS.md), выпуск — в [deploy.md](deploy.md).

@@ -1,25 +1,33 @@
-"""HTTP API для получения уведомлений и отправки в Telegram."""
+"""Авторизация, история и синхронная доставка уведомления в Telegram."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Any
+from uuid import uuid4
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
 
 from alertsbot.config import get_settings
+from alertsbot.history import History
+from alertsbot.logging import VERSION, configure_logging, exception_fields, request_id, utc_now
 from alertsbot.telegram import (
+    DeliveryStats,
     TelegramClientPool,
     TelegramPayloadError,
     TelegramPermanentError,
-    describe_proxy,
-    describe_telegram_error,
     send_message,
 )
 
@@ -32,29 +40,16 @@ DETAILS_MAX_LENGTH = 8192
 EVENT_ID_MAX_LENGTH = 128
 IDEMPOTENCY_TTL_SECONDS = 3600.0
 IDEMPOTENCY_MAX_RECORDS = 10_000
-# Реплеим только постоянные исходы; временные (502) не кэшируем, чтобы повтор
-# клиента с тем же event_id делал реальную новую попытку отправки.
 CACHEABLE_ERROR_STATUS_CODES = frozenset({422, 424})
-QUIET_HEALTH_PATHS = frozenset({"/health", "/healthz", "/readyz"})
-
-
-class HealthAccessFilter(logging.Filter):
-    """Не пишет успешные health-check, но сохраняет их ошибки."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not isinstance(record.args, tuple) or len(record.args) != 5:
-            return True
-        _client, method, target, _version, status = record.args
-        if not isinstance(target, str) or not isinstance(status, int):
-            return True
-        path = target.partition("?")[0]
-        return not (method == "GET" and path in QUIET_HEALTH_PATHS and 200 <= status < 400)
 
 
 @dataclass(frozen=True, slots=True)
 class NotifyResult:
     status_code: int
     body: dict[str, str]
+    reason: str = ""
+    telegram_status: int | None = None
+    sent_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,41 +65,28 @@ class EventLockEntry:
 
 
 class NotifyRequest(BaseModel):
-    """Запрос на отправку уведомления."""
-
-    service: str = Field(
-        ...,
-        max_length=SERVICE_MAX_LENGTH,
-        description="Название сервиса",
-    )
-    title: str = Field(
-        ...,
-        max_length=TITLE_MAX_LENGTH,
-        description="Заголовок уведомления",
-    )
-    message: str = Field(
-        ...,
-        max_length=MESSAGE_MAX_LENGTH,
-        description="Основной текст уведомления",
-    )
-    details: str | None = Field(
-        default=None,
-        max_length=DETAILS_MAX_LENGTH,
-        description="Дополнительные детали",
-    )
-    event_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=EVENT_ID_MAX_LENGTH,
-        description="Идемпотентный идентификатор события",
-    )
+    service: str
+    title: str
+    message: str
+    details: str | None = None
+    event_id: str | None = None
 
 
-settings = get_settings()
-docs_url = None if settings.is_production else "/docs"
-redoc_url = None if settings.is_production else "/redoc"
-openapi_url = None if settings.is_production else "/openapi.json"
-
+configure_logging("INFO")
+logger = logging.getLogger("alertsbot")
+try:
+    settings = get_settings()
+except ValidationError as error:
+    logger.error(
+        "Некорректная конфигурация",
+        extra={
+            "event": "startup_failed",
+            "fields": {"reason": "invalid_configuration", **exception_fields(error)},
+        },
+    )
+    raise SystemExit(1) from None
+configure_logging(settings.log_level, (settings.alerts_bot_token, settings.alerts_token))
+history = History(settings.db_path)
 _idempotency_records: dict[str, IdempotencyRecord] = {}
 _idempotency_locks: dict[str, EventLockEntry] = {}
 _idempotency_index_lock = asyncio.Lock()
@@ -113,6 +95,10 @@ _idempotency_index_lock = asyncio.Lock()
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
     fastapi_app.state.telegram_client_pool = TelegramClientPool(settings.request_timeout_seconds)
+    history.cleanup()
+    logger.info("Сервис запущен", extra={"event": "startup"})
+    if VERSION == "unknown":
+        logger.error("Версия выпуска неизвестна", extra={"event": "version_unavailable"})
     try:
         yield
     finally:
@@ -121,53 +107,90 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="alertsbot",
-    docs_url=docs_url,
-    redoc_url=redoc_url,
-    openapi_url=openapi_url,
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
     lifespan=lifespan,
 )
-logging.basicConfig(level=settings.log_level)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").addFilter(HealthAccessFilter())
-logger = logging.getLogger("alertsbot")
 
 
 def _is_authorized(provided_token: str | None) -> bool:
-    if not settings.alerts_token or provided_token is None:
-        return False
+    return (
+        bool(settings.alerts_token)
+        and provided_token is not None
+        and secrets.compare_digest(
+            provided_token.encode(),
+            settings.alerts_token.encode(),
+        )
+    )
 
-    return secrets.compare_digest(provided_token, settings.alerts_token)
+
+def normalize_payload(data: dict[str, Any]) -> tuple[NotifyRequest, list[str]]:
+    values: dict[str, Any] = {}
+    reasons: list[str] = []
+    for field in ("service", "title", "message", "details", "event_id"):
+        value = data.get(field)
+        if value is None:
+            if field in {"details", "event_id"}:
+                values[field] = None
+                continue
+            value = f"[поле {field} отсутствует]"
+            reasons.append(f"{field}:missing")
+        elif not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=True)
+            reasons.append(f"{field}:converted")
+        if not value.strip():
+            value = None if field in {"details", "event_id"} else f"[поле {field} пустое]"
+            reasons.append(f"{field}:empty")
+        values[field] = value
+    # Полный текст остаётся в истории. Усекается только представление для Telegram.
+    for field, limit in (
+        ("service", SERVICE_MAX_LENGTH),
+        ("title", TITLE_MAX_LENGTH),
+        ("message", MESSAGE_MAX_LENGTH),
+        ("details", DETAILS_MAX_LENGTH),
+    ):
+        if values[field] is not None and len(values[field]) > limit:
+            reasons.append(f"{field}:truncated")
+    if values["event_id"] is not None and len(values["event_id"]) > EVENT_ID_MAX_LENGTH:
+        reasons.append("event_id:hashed")
+    payload = NotifyRequest(**values)
+    if len(_alert_text(payload)) > TELEGRAM_MESSAGE_LIMIT:
+        reasons.append("telegram_text:truncated")
+    return payload, reasons
 
 
-def _fit_telegram_message_limit(text: str) -> str:
-    if len(text) <= TELEGRAM_MESSAGE_LIMIT:
-        return text
-
-    visible_text_limit = TELEGRAM_MESSAGE_LIMIT - len(TRUNCATION_NOTICE)
-    return f"{text[:visible_text_limit]}{TRUNCATION_NOTICE}"
+def _alert_text(payload: NotifyRequest) -> str:
+    text = (
+        f"{payload.service[:SERVICE_MAX_LENGTH]}\n{payload.title[:TITLE_MAX_LENGTH]}\n"
+        f"{payload.message[:MESSAGE_MAX_LENGTH]}"
+    )
+    if payload.details:
+        text += f"\n\n{payload.details[:DETAILS_MAX_LENGTH]}"
+    return text
 
 
 def format_alert(payload: NotifyRequest) -> str:
-    text = f"{payload.service}\n{payload.title}\n{payload.message}"
-    if payload.details:
-        text = f"{text}\n\n{payload.details}"
+    text = _alert_text(payload)
+    if len(text) <= TELEGRAM_MESSAGE_LIMIT:
+        return text
+    return text[: TELEGRAM_MESSAGE_LIMIT - len(TRUNCATION_NOTICE)] + TRUNCATION_NOTICE
 
-    return _fit_telegram_message_limit(text)
+
+def _event_key(event_id: str) -> str:
+    return hashlib.sha256(event_id.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
-def _telegram_client_pool() -> TelegramClientPool | None:
-    return getattr(app.state, "telegram_client_pool", None)
+def _logged_event_id(event_id: str | None) -> str | None:
+    if event_id is not None and len(event_id) > EVENT_ID_MAX_LENGTH:
+        return "sha256:" + _event_key(event_id)
+    return event_id
 
 
 def _prune_expired_idempotency_records(now: float) -> None:
-    expired_event_ids = [
-        event_id
-        for event_id, record in _idempotency_records.items()
-        if record.expires_at <= now
-    ]
-    for event_id in expired_event_ids:
-        _idempotency_records.pop(event_id, None)
+    for event_id in list(_idempotency_records):
+        if _idempotency_records[event_id].expires_at <= now:
+            del _idempotency_records[event_id]
 
 
 @asynccontextmanager
@@ -178,9 +201,7 @@ async def _hold_event_lock(event_id: str) -> AsyncIterator[None]:
         if entry is None:
             entry = EventLockEntry(lock=asyncio.Lock())
             _idempotency_locks[event_id] = entry
-
         entry.refs += 1
-
     try:
         async with entry.lock:
             yield
@@ -191,121 +212,185 @@ async def _hold_event_lock(event_id: str) -> AsyncIterator[None]:
                 _idempotency_locks.pop(event_id, None)
 
 
-def _cached_notify_result(event_id: str) -> NotifyResult | None:
-    now = time.monotonic()
-    _prune_expired_idempotency_records(now)
-    record = _idempotency_records.get(event_id)
-    if record is None:
-        return None
-
-    if record.expires_at <= now:
-        _idempotency_records.pop(event_id, None)
-        return None
-
-    return record.result
-
-
 def _remember_notify_result(event_id: str, result: NotifyResult) -> None:
     while len(_idempotency_records) >= IDEMPOTENCY_MAX_RECORDS:
-        oldest_event_id = next(iter(_idempotency_records))
-        _idempotency_records.pop(oldest_event_id)
-
+        _idempotency_records.pop(next(iter(_idempotency_records)))
     _idempotency_records[event_id] = IdempotencyRecord(
         result=result,
         expires_at=time.monotonic() + IDEMPOTENCY_TTL_SECONDS,
     )
 
 
-def _replay_notify_result(result: NotifyResult) -> dict[str, str]:
-    if result.status_code >= 400:
-        raise HTTPException(status_code=result.status_code, detail=result.body["detail"])
-
-    return dict(result.body)
-
-
-def _exception_result(error: HTTPException) -> NotifyResult:
-    return NotifyResult(
-        status_code=error.status_code,
-        body={"detail": str(error.detail)},
-    )
-
-
-async def _send_notify(payload: NotifyRequest) -> dict[str, str]:
-    text = format_alert(payload)
-
-    send_kwargs = {}
-    telegram_client_pool = _telegram_client_pool()
-    if telegram_client_pool is not None:
-        send_kwargs["client_pool"] = telegram_client_pool
-
+async def _send_notify(payload: NotifyRequest, stats: DeliveryStats) -> NotifyResult:
+    started = time.monotonic()
     try:
-        proxy_url = await send_message(
+        await send_message(
             settings.alerts_bot_token,
             settings.alerts_chat_id,
-            text,
-            settings.request_timeout_seconds,
+            format_alert(payload),
             settings.telegram_proxy_sequence,
             settings.telegram_proxy_circuit_breaker_seconds,
-            **send_kwargs,
+            client_pool=app.state.telegram_client_pool,
+            stats=stats,
         )
     except TelegramPayloadError as error:
-        logger.error("Telegram rejected payload: %s", describe_telegram_error(error))
-        raise HTTPException(status_code=422, detail="Telegram payload rejected") from error
-    except TelegramPermanentError as error:
-        logger.error("Permanent Telegram error: %s", describe_telegram_error(error))
-        raise HTTPException(status_code=424, detail="Permanent Telegram error") from error
-    except Exception as error:  # noqa: BLE001
-        logger.error("Temporary Telegram error: %s", describe_telegram_error(error))
-        raise HTTPException(status_code=502, detail="Temporary Telegram error") from error
-
-    logger.info("Telegram alert sent via %s", describe_proxy(proxy_url))
-    return {"status": "sent"}
-
-
-async def _send_notify_once_per_event(payload: NotifyRequest) -> dict[str, str]:
-    if payload.event_id is None:
-        return await _send_notify(payload)
-
-    async with _hold_event_lock(payload.event_id):
-        cached_result = _cached_notify_result(payload.event_id)
-        if cached_result is not None:
-            return _replay_notify_result(cached_result)
-
-        try:
-            result_body = await _send_notify(payload)
-        except HTTPException as error:
-            if error.status_code in CACHEABLE_ERROR_STATUS_CODES:
-                _remember_notify_result(payload.event_id, _exception_result(error))
-            raise
-
-        _remember_notify_result(
-            payload.event_id,
-            NotifyResult(status_code=200, body=result_body),
+        stats.status = error.status_code
+        return NotifyResult(
+            422, {"detail": "Telegram payload rejected"}, "telegram_payload_rejected", stats.status
         )
-        return result_body
+    except TelegramPermanentError as error:
+        stats.status = error.status_code
+        return NotifyResult(
+            424, {"detail": "Permanent Telegram error"}, "telegram_permanent_error", stats.status
+        )
+    except Exception as error:
+        stats.exception = error
+        if isinstance(error, httpx.HTTPStatusError):
+            stats.status = error.response.status_code
+        # В итог идёт тип и безопасная причина; URL/текст исключения не выводятся.
+        return NotifyResult(
+            502, {"detail": "Temporary Telegram error"}, "telegram_temporary_error", stats.status
+        )
+    finally:
+        stats.telegram_ms = round((time.monotonic() - started) * 1000, 3)
+    return NotifyResult(200, {"status": "sent"}, telegram_status=stats.status, sent_at=utc_now())
+
+
+async def _send_notify_once_per_event(payload: NotifyRequest, stats: DeliveryStats) -> NotifyResult:
+    if payload.event_id is None:
+        return await _send_notify(payload, stats)
+    key = _event_key(payload.event_id)
+    async with _hold_event_lock(key):
+        cached = _idempotency_records.get(key)
+        if cached is not None and cached.expires_at > time.monotonic():
+            stats.cached = True
+            return cached.result
+        result = await _send_notify(payload, stats)
+        if result.status_code == 200 or result.status_code in CACHEABLE_ERROR_STATUS_CODES:
+            _remember_notify_result(key, result)
+        return result
 
 
 @app.get("/healthz")
 @app.get("/health")
 async def health() -> dict[str, str]:
-    """Проверка доступности сервиса."""
-
     return {"status": "ok"}
 
 
 @app.get("/readyz")
 async def ready() -> dict[str, str]:
+    if not history.ready():
+        raise HTTPException(status_code=503, detail="Alert history unavailable")
     return {"status": "ready"}
 
 
 @app.post("/notify")
-async def notify(
-    payload: NotifyRequest,
-    x_alerts_token: str | None = Header(default=None, alias="X-Alerts-Token"),
-) -> dict[str, str]:
-    """Отправляет уведомление в Telegram."""
-
-    if not _is_authorized(x_alerts_token):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    return await _send_notify_once_per_event(payload)
+async def notify(request: Request) -> JSONResponse:
+    started = time.monotonic()
+    incoming_id = request.headers.get("X-Request-ID", "")
+    work_id = incoming_id if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", incoming_id) else uuid4().hex
+    context_token = request_id.set(work_id)
+    client = request.client.host if request.client else "unknown"
+    row_id = None
+    payload = None
+    reasons: list[str] = []
+    stats = DeliveryStats()
+    outcome = "error"
+    result = NotifyResult(500, {"detail": "Internal error"}, "internal_error")
+    try:
+        if not _is_authorized(request.headers.get("X-Alerts-Token")):
+            result = NotifyResult(401, {"detail": "Unauthorized"}, "unauthorized")
+            outcome = "rejected"
+        else:
+            try:
+                data = await request.json()
+            except (ValueError, UnicodeError, RecursionError):
+                data = None
+            if not isinstance(data, dict):
+                row_id = history.insert({}, client, "rejected")
+                result = NotifyResult(
+                    422, {"detail": "Expected JSON object"}, "invalid_json_object"
+                )
+                outcome = "rejected"
+            else:
+                payload, reasons = normalize_payload(data)
+                row_id = history.insert(payload.model_dump(), client)
+                if row_id is None:
+                    reasons.append("database_failure")
+                result = await _send_notify_once_per_event(payload, stats)
+                outcome = (
+                    "error" if result.status_code >= 400 else "skipped" if stats.cached else "ok"
+                )
+                if result.status_code == 200:
+                    if stats.attempts > 1:
+                        reasons.append("telegram_retry")
+                    if reasons:
+                        outcome = "fallback"
+        return JSONResponse(
+            result.body, status_code=result.status_code, headers={"X-Request-ID": work_id}
+        )
+    except asyncio.CancelledError:
+        result = NotifyResult(499, {}, "cancelled")
+        outcome = "cancelled"
+        raise
+    except Exception as error:
+        stats.exception = error
+        return JSONResponse(
+            result.body,
+            status_code=500,
+            headers={"X-Request-ID": work_id},
+        )
+    finally:
+        reason = ";".join(filter(None, [result.reason, *reasons]))
+        if row_id is not None:
+            updated = history.finish(
+                row_id,
+                "rejected"
+                if outcome == "rejected"
+                else "sent"
+                if result.status_code == 200
+                else "failed",
+                result.status_code,
+                result.telegram_status,
+                reason,
+                result.sent_at,
+                stats.cached,
+            )
+            if not updated and result.status_code == 200:
+                outcome = "fallback"
+                if "database_failure" not in reasons:
+                    reason = ";".join(filter(None, [reason, "database_failure"]))
+        level = (
+            logging.ERROR
+            if outcome == "error"
+            else (logging.WARNING if outcome in {"fallback", "rejected"} else logging.INFO)
+        )
+        logger.log(
+            level,
+            "Запрос уведомления завершён",
+            extra={
+                "event": "notify_done",
+                "fields": {
+                    "outcome": outcome,
+                    "reason": reason,
+                    "history_id": row_id,
+                    "event_id": _logged_event_id(payload.event_id) if payload else None,
+                    "alert_service": payload.service[:SERVICE_MAX_LENGTH] if payload else None,
+                    "alert_title": payload.title[:TITLE_MAX_LENGTH] if payload else None,
+                    "client": client,
+                    "method": "POST",
+                    "route": "/notify",
+                    "http_status": result.status_code,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                    "telegram_ms": stats.telegram_ms,
+                    "proxy": stats.proxy,
+                    "attempts": stats.attempts,
+                    "cached": stats.cached,
+                    "telegram_status": result.telegram_status,
+                    "error_code": stats.error_code,
+                    "exception_type": None,
+                    **exception_fields(stats.exception),
+                },
+            },
+        )
+        request_id.reset(context_token)

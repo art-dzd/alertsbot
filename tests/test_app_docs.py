@@ -69,9 +69,8 @@ def test_healthz_endpoint_stays_available_in_prod(monkeypatch: MonkeyPatch) -> N
 
 
 def test_readyz_endpoint_reports_ready_with_valid_config(monkeypatch: MonkeyPatch) -> None:
-    client = TestClient(load_app_with_env(monkeypatch, "production"))
-
-    response = client.get("/readyz")
+    with TestClient(load_app_with_env(monkeypatch, "production")) as client:
+        response = client.get("/readyz")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
@@ -84,7 +83,7 @@ def test_health_access_filter_hides_only_success(monkeypatch: MonkeyPatch) -> No
 
     assert access_filter.filter(access_record("/healthz", 200)) is False
     assert access_filter.filter(access_record("/readyz", 503)) is True
-    assert access_filter.filter(access_record("/notify", 200)) is True
+    assert access_filter.filter(access_record("/notify", 200)) is False
 
     unexpected_record = access_record("/healthz", 200)
     unexpected_record.args = ("127.0.0.1:1234", "GET", "/healthz", "1.1", None)
