@@ -784,6 +784,20 @@ def test_non_object_body_is_rejected_and_recorded(
     assert "private text" not in caplog.text
 
 
+def test_oversized_body_is_rejected_and_recorded(notify_app: tuple[Any, TestClient]) -> None:
+    app_module, client = notify_app
+    body = '{"service": "x", "message": "' + "a" * app_module.BODY_MAX_BYTES + '"}'
+    response = client.post("/notify", headers={"X-Alerts-Token": "shared-secret"}, content=body)
+    assert response.status_code == 413
+    row = history_rows(app_module)[0]
+    assert (row["status"], row["http_status"], row["reason"]) == (
+        "rejected",
+        413,
+        "body_too_large",
+    )
+    assert row["message"] is None
+
+
 @pytest.mark.parametrize("token", [None, "wrong-secret", ""])
 def test_unauthorized_requests_have_no_history(
     notify_app: tuple[Any, TestClient],

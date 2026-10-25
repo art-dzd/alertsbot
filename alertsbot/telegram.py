@@ -47,6 +47,10 @@ class TelegramRateLimitError(TelegramError):
     pass
 
 
+class TelegramBadResponseError(TelegramError):
+    """2xx без `ok: true`: посредник ответил не телом Telegram, доставка не подтверждена."""
+
+
 class TelegramClientPool:
     def __init__(self, timeout: float) -> None:
         self._timeout = timeout
@@ -118,11 +122,15 @@ def _is_retryable_error(error: Exception) -> bool:
     if isinstance(error, httpx.HTTPStatusError):
         return error.response.status_code >= 500
 
-    return isinstance(error, httpx.TimeoutException | httpx.TransportError)
+    return isinstance(
+        error, httpx.TimeoutException | httpx.TransportError | TelegramBadResponseError
+    )
 
 
 def _should_mark_proxy_unhealthy(error: Exception) -> bool:
-    return isinstance(error, httpx.TimeoutException | httpx.TransportError)
+    return isinstance(
+        error, httpx.TimeoutException | httpx.TransportError | TelegramBadResponseError
+    )
 
 
 def _retry_after_seconds(response: httpx.Response) -> float:
@@ -217,6 +225,15 @@ async def _send_message_once(
         error_code = body.get("error_code") if isinstance(body, dict) else None
         stats.error_code = error_code if isinstance(error_code, int) else response.status_code
     _raise_for_telegram_status(response)
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        stats.error_code = -1  # не ответ Telegram; status 200 сам по себе не доставка
+        raise TelegramBadResponseError(
+            "Telegram response without ok", status_code=response.status_code
+        )
 
 
 @dataclass(slots=True)

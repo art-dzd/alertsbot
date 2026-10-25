@@ -78,7 +78,7 @@ class FakeAsyncClient:
             status_code, json_data = outcome
             return FakeResponse(status_code, url, json_data)
 
-        return FakeResponse(outcome, url)
+        return FakeResponse(outcome, url, {"ok": True} if outcome < 400 else None)
 
 
 def setup_fake_client(monkeypatch: MonkeyPatch, outcomes: list[FakeOutcome]) -> None:
@@ -153,6 +153,29 @@ def test_send_message_retries_final_proxy_once(monkeypatch: MonkeyPatch) -> None
         "http://reserve:8888",
         "http://reserve:8888",
     ]
+
+
+def test_send_message_treats_success_without_ok_as_failed_proxy(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [(200, {"result": "proxy page"}), 200])
+
+    used_proxy = send_for_test(("http://primary:8888", "http://reserve:8888"))
+
+    assert used_proxy == "http://reserve:8888"
+    assert FakeAsyncClient.calls == ["http://primary:8888", "http://reserve:8888"]
+    assert "http://primary:8888" in telegram._unhealthy_proxy_until
+
+
+def test_send_message_treats_non_json_success_as_failed_proxy(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [(200, None), 200])
+
+    assert send_for_test(("http://primary:8888", "http://reserve:8888")) == "http://reserve:8888"
+
+
+def test_send_message_raises_when_no_proxy_confirms_delivery(monkeypatch: MonkeyPatch) -> None:
+    setup_fake_client(monkeypatch, [(200, {"ok": False}), (200, {"ok": False})])
+
+    with raises(telegram.TelegramBadResponseError):
+        send_for_test(("http://primary:8888",))
 
 
 def test_send_message_uses_circuit_breaker_after_failure(monkeypatch: MonkeyPatch) -> None:

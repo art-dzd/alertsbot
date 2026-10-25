@@ -23,7 +23,9 @@ title до 256, message до 4096, details до 8192 символов; полн�
 `notify_done` WARNING `outcome=fallback` с именами полей и причинами, без их содержимого.
 
 Невалидный JSON, массив, строка, число, null: `422 {"detail":"Expected JSON object"}`,
-WARNING `invalid_json_object`, история `rejected` без содержимого запроса.
+WARNING `invalid_json_object`, история `rejected` без содержимого запроса. Тело больше 1 МиБ:
+`413 {"detail":"Body too large"}`, WARNING `body_too_large`, история `rejected` без содержимого
+(в истории за всё время максимум ~2 КБ; строка `rejected` доходит до admin/alerts пересыльщиком).
 
 ## Формат Telegram
 
@@ -38,10 +40,11 @@ WARNING `invalid_json_object`, история `rejected` без содержим
 |---|---|---|
 | 200 | `{"status":"sent"}` | Доставлено или прежний успех из кэша |
 | 401 | `{"detail":"Unauthorized"}` | Нет авторизации |
+| 413 | `{"detail":"Body too large"}` | Тело больше 1 МиБ |
 | 422 | `{"detail":"Expected JSON object"}` | Тело не JSON-объект |
 | 422 | `{"detail":"Telegram payload rejected"}` | Telegram 400 |
 | 424 | `{"detail":"Permanent Telegram error"}` | Другие постоянные 4xx Telegram |
-| 502 | `{"detail":"Temporary Telegram error"}` | Сеть, 5xx или исчерпанный 429 |
+| 502 | `{"detail":"Temporary Telegram error"}` | Сеть, 5xx, 2xx без `ok:true` у всех прокси или исчерпанный 429 |
 
 Ответ содержит `X-Request-ID`. Ошибка SQLite не меняет код/тело ответа доставки.
 

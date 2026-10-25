@@ -38,6 +38,8 @@ TITLE_MAX_LENGTH = 256
 MESSAGE_MAX_LENGTH = 4096
 DETAILS_MAX_LENGTH = 8192
 EVENT_ID_MAX_LENGTH = 128
+# Поля и так режутся под Telegram; лимит защищает память и историю от мусорного клиента.
+BODY_MAX_BYTES = 1024 * 1024
 IDEMPOTENCY_TTL_SECONDS = 3600.0
 IDEMPOTENCY_MAX_RECORDS = 10_000
 CACHEABLE_ERROR_STATUS_CODES = frozenset({422, 424})
@@ -302,11 +304,24 @@ async def notify(request: Request) -> JSONResponse:
             result = NotifyResult(401, {"detail": "Unauthorized"}, "unauthorized")
             outcome = "rejected"
         else:
-            try:
-                data = await request.json()
-            except (ValueError, UnicodeError, RecursionError):
-                data = None
-            if not isinstance(data, dict):
+            body = bytearray()
+            too_large = False
+            async for chunk in request.stream():
+                body += chunk
+                if len(body) > BODY_MAX_BYTES:
+                    too_large = True
+                    break
+            data = None
+            if not too_large:
+                try:
+                    data = json.loads(body)
+                except (ValueError, UnicodeError, RecursionError):
+                    pass
+            if too_large:
+                row_id = history.insert({}, client, "rejected")
+                result = NotifyResult(413, {"detail": "Body too large"}, "body_too_large")
+                outcome = "rejected"
+            elif not isinstance(data, dict):
                 row_id = history.insert({}, client, "rejected")
                 result = NotifyResult(
                     422, {"detail": "Expected JSON object"}, "invalid_json_object"
