@@ -108,16 +108,7 @@ jobs:
             echo "Deploy failed at line ${failed_line}; rolling back to ${PREVIOUS_SHA}" >&2
             sudo -u alertsbot git reset --hard "$PREVIOUS_SHA" || true
             sudo -u alertsbot .venv/bin/pip install -r requirements.txt || true
-            if [ -f scripts/install_units.sh ]; then
-              bash scripts/install_units.sh || true
-            else
-              # Выпуск до alertsbot.socket сам слушает порт: сокет снять до его старта.
-              sudo systemctl disable --now alertsbot.socket || true
-              sudo rm -f /etc/systemd/system/alertsbot.socket
-              sudo cp systemd/alertsbot.service /etc/systemd/system/alertsbot.service || true
-              sudo systemctl daemon-reload || true
-              sudo systemctl restart alertsbot || true
-            fi
+            bash scripts/install_units.sh || true
             wait_health || true
           }
 

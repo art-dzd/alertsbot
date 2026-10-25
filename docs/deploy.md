@@ -15,9 +15,8 @@ CI держит отдельный venv и под flock выполняет:
 4. Читает только журнал нового InvocationID. `scripts/check_startup.py` требует
    корректный JSON, `startup` с целевой версией и отсутствие ERROR/CRITICAL.
    Версия в приложении и CI — `git rev-parse --short=12 HEAD`.
-5. Любой сбой вызывает откат: предыдущий git HEAD и зависимости, затем его
-   `install_units.sh`; у выпуска без него — снятие `alertsbot.socket`, старый юнит, restart.
-   Дальше healthcheck. Журнал выводится при провале job.
+5. Любой сбой вызывает откат: предыдущий git HEAD и зависимости, его `install_units.sh`,
+   healthcheck. Журнал выводится при провале job.
 
 ## Данные и настройки
 
