@@ -57,6 +57,9 @@ with closing(sqlite3.connect('file:/var/lib/alertsbot/alerts.db?mode=ro', uri=Tr
 PY
 ```
 
+Порт 9100 держит `alertsbot.socket`: на рестарте запросы ждут ~5 с старта, а не
+получают отказ. Юниты ставит `scripts/install_units.sh`.
+
 Health: `curl -fsS http://127.0.0.1:9100/healthz` — живость;
 `curl -fsS http://127.0.0.1:9100/readyz` — конфигурация и доступность истории.
 Telegram health не вызывает. Метрик ресурсов внутри сервиса нет: их собирают на хосте.
@@ -110,6 +113,6 @@ journalctl -u alerts-tab-forwarder -n 100 --no-pager -o cat
 .venv/bin/python -m mypy
 ```
 
-Системный юнит: `systemd/alertsbot.service`. Канонический выпуск — Gitea CI;
+Системные юниты: `systemd/alertsbot.service` и `systemd/alertsbot.socket`. Канонический выпуск — Gitea CI;
 `bash scripts/restart.sh` — резервный путь. После рестарта обязательны health,
 `startup` с SHA выпуска и отсутствие ERROR до неё.

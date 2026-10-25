@@ -9,7 +9,4 @@ else
   .venv/bin/pip install -r requirements.txt
 fi
 
-sudo cp systemd/alertsbot.service /etc/systemd/system/alertsbot.service
-sudo systemctl daemon-reload
-sudo systemctl enable alertsbot
-sudo systemctl restart alertsbot
+bash scripts/install_units.sh

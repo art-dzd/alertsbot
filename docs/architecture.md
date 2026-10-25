@@ -83,8 +83,9 @@ SQLite-файл может сохранять свободные страниц�
 | `TELEGRAM_PROXY_URL` | пусто; обратная совместимость, иначе direct |
 | `TELEGRAM_PROXY_CIRCUIT_BREAKER_SECONDS` | `120`, конечное число >= 0 |
 
-`ALERTS_APP_HOST`/`ALERTS_APP_PORT` остаются переменными systemd для uvicorn;
-Settings их не читает. Пустые/placeholder секреты в prod запрещают старт.
+Порт `0.0.0.0:9100` держит `systemd/alertsbot.socket` и передаёт uvicorn как fd 3: на рестарте
+соединения ждут в очереди ядра (старт ~5 с), а не получают отказ. `ALERTS_APP_HOST`/`ALERTS_APP_PORT`
+в `.env` больше не используются; Settings их не читает. Пустые/placeholder секреты в prod запрещают старт.
 
 ## Журнал
 

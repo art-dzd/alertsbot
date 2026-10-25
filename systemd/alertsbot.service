@@ -1,6 +1,9 @@
 [Unit]
 Description=alertsbot
-After=network.target
+Requires=alertsbot.socket
+After=network.target alertsbot.socket
+# Запуски от входящих соединений не упираются в лимит стартов: порт не закроется.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,7 +16,8 @@ StateDirectory=alertsbot
 StateDirectoryMode=0700
 UMask=0077
 # Ровно один воркер: circuit breaker и идемпотентность по event_id живут в памяти процесса.
-ExecStart=/alertsbot/.venv/bin/uvicorn alertsbot.app:app --host ${ALERTS_APP_HOST} --port ${ALERTS_APP_PORT} --workers 1 --no-access-log
+# Слушающий сокет приходит от alertsbot.socket как fd 3.
+ExecStart=/alertsbot/.venv/bin/uvicorn alertsbot.app:app --fd 3 --workers 1 --no-access-log
 Restart=always
 RestartSec=5
 

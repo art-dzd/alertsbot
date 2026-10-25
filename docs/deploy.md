@@ -9,19 +9,22 @@
 CI держит отдельный venv и под flock выполняет:
 
 1. Запоминает предыдущий SHA, устанавливает целевой git HEAD и зависимости.
-2. Копирует systemd-юнит, daemon-reload, restart.
+2. `scripts/install_units.sh`: юниты (сервис и сокет), daemon-reload, restart.
 3. Запоминает InvocationID нового запуска, проверяет health (до 10 попыток), active
    и отсутствие перезапуска между проверками.
 4. Читает только журнал нового InvocationID. `scripts/check_startup.py` требует
    корректный JSON, `startup` с целевой версией и отсутствие ERROR/CRITICAL.
    Версия в приложении и CI — `git rev-parse --short=12 HEAD`.
-5. Любой сбой вызывает существующий откат: предыдущий git HEAD, зависимости/юнит,
-   daemon-reload, restart и healthcheck. Журнал выводится при провале job.
+5. Любой сбой вызывает откат: предыдущий git HEAD и зависимости, затем его
+   `install_units.sh`; у выпуска без него — снятие `alertsbot.socket`, старый юнит, restart.
+   Дальше healthcheck. Журнал выводится при провале job.
 
 ## Данные и настройки
 
-`.env` уже содержит заполненные секреты и `ALERTS_APP_HOST`/`ALERTS_APP_PORT` для
-uvicorn. Settings host/port не читает. Продовый `.env` не изменяется при выкладке.
+`.env` уже содержит заполненные секреты. Адрес задаёт `systemd/alertsbot.socket`, а не
+`ALERTS_APP_HOST`/`ALERTS_APP_PORT`. Юниты ставит и сервис рестартит `scripts/install_units.sh`;
+при переходе со старого юнита он останавливает сервис и поднимает сокет. Откат на выпуск без
+сокета снимает `alertsbot.socket`, иначе старый юнит не займёт порт. Продовый `.env` не изменяется при выкладке.
 `ALERTS_ENV=prod` запрещает старт с пустыми/placeholder секретами.
 
 Новый юнит: `StateDirectory=alertsbot`, `StateDirectoryMode=0700`, `UMask=0077`.
@@ -40,6 +43,8 @@ curl -fsS http://127.0.0.1:9100/healthz
 curl -fsS http://127.0.0.1:9100/readyz
 journalctl -u alertsbot -n 100 --no-pager -o cat
 diff /etc/systemd/system/alertsbot.service /alertsbot/systemd/alertsbot.service
+diff /etc/systemd/system/alertsbot.socket /alertsbot/systemd/alertsbot.socket
+systemctl is-active alertsbot.socket
 ```
 
 Живость: `healthz` → ok. Готовность: `readyz` → ready (конфиг и БД; не Telegram).
@@ -54,7 +59,11 @@ diff /etc/systemd/system/alertsbot.service /alertsbot/systemd/alertsbot.service
 После него те же post-check обязательны вручную.
 
 Ручной откат по разрешению: `sudo -u alertsbot git -C /alertsbot reset --hard <SHA>`,
-затем `bash scripts/restart.sh` и post-check. SQLite не удалять: старый код может
+затем `bash scripts/restart.sh` и post-check. Если в целевом выпуске нет
+`systemd/alertsbot.socket`, сначала `sudo systemctl disable --now alertsbot.socket` и
+`sudo rm /etc/systemd/system/alertsbot.socket`, иначе старый юнит не займёт порт 9100.
+Правка `alertsbot.socket` вступает в силу только после `sudo systemctl restart alertsbot.socket`
+(на это время порт закрыт); `install_units.sh` её не перезапускает. SQLite не удалять: старый код может
 не читать историю, но файл останется для последующего обновления/разбора.
 Автоматический откат проверяет health, а ручная проверка журнала отката остаётся
 за оператором (старые выпуски могут писать прежний формат).

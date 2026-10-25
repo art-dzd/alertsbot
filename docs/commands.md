@@ -37,6 +37,9 @@ bash scripts/restart.sh
 systemctl status alertsbot --no-pager
 journalctl -u alertsbot -n 200 --no-pager
 systemctl restart alertsbot
+# Остановить совсем: stop alertsbot только гасит процесс, порт держит сокет,
+# и следующее соединение снова запустит сервис.
+sudo systemctl stop alertsbot.socket alertsbot
 ```
 
 ## Быстрая проверка синтаксиса Python

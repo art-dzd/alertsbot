@@ -1,0 +1,14 @@
+[Unit]
+Description=alertsbot: порт приёма алертов
+
+# Порт держит systemd: пока сервис перезапускается, соединения ждут в очереди ядра,
+# а не получают отказ (отправители без повтора иначе теряют алерт на выкатах).
+[Socket]
+ListenStream=0.0.0.0:9100
+Backlog=2048
+NoDelay=true
+# Сервис в крэш-цикле не должен уводить сокет в failed и закрывать порт.
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=sockets.target
