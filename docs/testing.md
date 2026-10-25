@@ -30,7 +30,7 @@ Quality gate: pytest, ruff, mypy. Целевая версия Python 3.10 (prod/
 - event_id: последовательные/параллельные повторы, TTL, вытеснение, повтор после 502.
 - JSON-формат, безопасные ошибки, request_id, startup, ровно один notify_done,
   отсутствие дублирующего access/успешных health-логов.
-- Post-check CI отклоняет отсутствие целевого startup, ERROR и не-JSON строки.
+- Post-check CI отклоняет отсутствие целевого startup, ERROR/CRITICAL и не-JSON до startup.
 
 Settings не читают `.env`/окружение машины: тестовая фикстура убирает ALERTS/прокси
 переменные и отключает env_file. БД изолированы в tmp_path; часы breaker/TTL/чистки
@@ -40,6 +40,7 @@ Settings не читают `.env`/окружение машины: тестов�
 ## Приёмка выпуска
 
 CI включает mypy, ruff и тесты. После рестарта проверяются health, active, неизменный
-InvocationID, JSON-журнал этого запуска: startup с целевым SHA и отсутствие ERROR.
+InvocationID, JSON-журнал этого запуска: startup с целевым SHA и отсутствие ERROR
+до startup. Ошибки после startup не откатывают выпуск.
 При отказе post-check срабатывает откат. Успешный pytest не доказывает выкладку.
 Внешний smoke /notify отправляет настоящее сообщение: выполнять только по разрешению.

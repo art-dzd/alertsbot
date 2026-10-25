@@ -3,6 +3,11 @@
 Мини‑сервис для отправки уведомлений в Telegram. Используется как прокладка между
 приложениями и чатами, без бизнес‑логики.
 
+Сервис хранит историю в SQLite, дедуплицирует повторы по `event_id`, повторяет
+доставку в Telegram при временных сбоях, поддерживает несколько Telegram-прокси
+и отдаёт `/healthz` и `/readyz`. На проде работает systemd-юнит с сокетом, выпуск
+идёт через Gitea CI; пересыльщик истории во вкладку tpanel — `scripts/tab_forwarder.py`.
+
 ## Запуск
 
 ```bash
@@ -13,15 +18,14 @@ cp .env.example .env
 uvicorn alertsbot.app:app --host 0.0.0.0 --port 9100
 ```
 
-Если Telegram недоступен напрямую (блокировки/ограничения), можно указать прокси для Telegram API:
-
-```bash
-TELEGRAM_PROXY_URL=http://127.0.0.1:7890
-```
+Если Telegram недоступен напрямую (блокировки/ограничения), можно указать прокси
+для Telegram API (`TELEGRAM_PROXY_URL`) или их упорядоченный список
+(`TELEGRAM_PROXY_URLS`).
 
 ## Эндпоинты
 
 - `GET /healthz` — health‑check.
+- `GET /readyz` — проверка конфигурации и истории.
 - `POST /notify` — отправка уведомления.
 
 ### Формат запроса
@@ -36,3 +40,12 @@ TELEGRAM_PROXY_URL=http://127.0.0.1:7890
   "details": "Дополнительно (опционально)"
 }
 ```
+
+## Документация
+
+- [AGENTS.md](AGENTS.md) — правила, контракт и эксплуатация.
+- [docs/architecture.md](docs/architecture.md) — устройство и поток доставки.
+- [docs/design/notify-flow.md](docs/design/notify-flow.md) — контракт `/notify`.
+- [docs/deploy.md](docs/deploy.md) — выпуск, systemd и откат.
+- [docs/testing.md](docs/testing.md) — проверки и приёмка.
+- [docs/commands.md](docs/commands.md) — команды.
