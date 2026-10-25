@@ -11,7 +11,7 @@ from pytest import LogCaptureFixture, MonkeyPatch, raises
 from alertsbot import telegram
 from alertsbot.config import Settings
 
-FakeOutcome = Exception | int | tuple[int, dict[str, Any]]
+FakeOutcome = Exception | int | tuple[int, dict[str, Any] | None]
 
 
 class FakeResponse:
