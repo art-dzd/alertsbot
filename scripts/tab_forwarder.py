@@ -24,6 +24,8 @@ MESSAGE_LIMIT = 6000
 MOSCOW = timezone(timedelta(hours=3))
 # Худший проход (два ssh-маршрута, внешний readyz, два tpanel) укладывается в TimeoutStartSec=90s.
 SSH_TIMEOUT_SECONDS = 15
+# 26.10 /readyz отвечал ~11 с; таймаут больше него и меньше SSH_TIMEOUT_SECONDS.
+REMOTE_READYZ_TIMEOUT_SECONDS = 12
 PUBLIC_TIMEOUT_SECONDS = 10
 TPANEL_TIMEOUT_SECONDS = 20
 # Этим путём шлют vpn, hr, gitea; его поломку при живом alertsbot иначе не видит никто.
@@ -42,7 +44,10 @@ import urllib.request
 from contextlib import closing
 
 try:
-    urllib.request.urlopen('http://127.0.0.1:9100/readyz', timeout=5).close()
+    urllib.request.urlopen(
+        'http://127.0.0.1:9100/readyz',
+        timeout={REMOTE_READYZ_TIMEOUT_SECONDS},
+    ).close()
 except Exception:
     sys.exit({ALERTSBOT_NOT_READY})
 

@@ -4,7 +4,9 @@ import asyncio
 import importlib
 import logging
 import sys
+import threading
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -1018,3 +1020,58 @@ def test_real_sender_retry_metadata_and_safe_provider_error(
     assert fields["telegram_ms"] >= 0
     assert "private response" not in caplog.text
     assert "VERY_SECRET_TOKEN" not in caplog.text
+
+
+def test_slow_history_insert_does_not_block_second_notify_or_health(
+    monkeypatch: MonkeyPatch, notify_app: tuple[Any, TestClient]
+) -> None:
+    app_module, client = notify_app
+    insert_started = threading.Event()
+    release_insert = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def slow_insert(
+        payload: dict[str, Any], client_name: str, status: str = "pending"
+    ) -> int:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            insert_started.set()
+            assert release_insert.wait(5)
+            return 1
+        return 2
+
+    def fake_finish(*args: object, **kwargs: object) -> bool:
+        return True
+
+    async def fake_send(*args: object, **kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(app_module.history, "insert", slow_insert)
+    monkeypatch.setattr(app_module.history, "finish", fake_finish)
+    monkeypatch.setattr(app_module, "send_message", fake_send)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(
+            client.post,
+            "/notify",
+            headers={"X-Alerts-Token": "shared-secret"},
+            json=sample_payload(),
+        )
+        assert insert_started.wait(2)
+        second = pool.submit(
+            client.post,
+            "/notify",
+            headers={"X-Alerts-Token": "shared-secret"},
+            json=sample_payload(),
+        )
+        health = pool.submit(client.get, "/healthz")
+        try:
+            assert second.result(timeout=2).status_code == 200
+            assert health.result(timeout=2).status_code == 200
+        finally:
+            release_insert.set()
+        assert first.result(timeout=5).status_code == 200

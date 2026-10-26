@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from alertsbot.logging import exception_fields, utc_now
@@ -40,12 +42,24 @@ class History:
     def __init__(self, path: str) -> None:
         self.path = path
         self._last_cleanup = float("-inf")
+        self._schema_ready = False
+        self._schema_lock = threading.Lock()
 
     def _execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> int | None:
         # lean: короткие синхронные записи для ~15 отправителей, без очереди и потока.
+        if self._schema_ready:
+            try:
+                if Path(self.path).stat().st_size == 0:
+                    self._schema_ready = False
+            except OSError:
+                self._schema_ready = False
         try:
             with closing(sqlite3.connect(self.path, timeout=0.1)) as connection, connection:
-                connection.executescript(SCHEMA)
+                if not self._schema_ready:
+                    with self._schema_lock:
+                        if not self._schema_ready:
+                            connection.executescript(SCHEMA)
+                            self._schema_ready = True
                 cursor = connection.execute(sql, parameters)
                 return cursor.lastrowid or 0
         except (sqlite3.Error, OSError, UnicodeError) as error:
@@ -65,11 +79,11 @@ class History:
         now = time.monotonic()
         if now - self._last_cleanup < CLEANUP_INTERVAL_SECONDS:
             return
-        self._last_cleanup = now
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat(
             timespec="milliseconds",
         )
-        self._execute("DELETE FROM alerts WHERE created_at < ?", (cutoff,))
+        if self._execute("DELETE FROM alerts WHERE created_at < ?", (cutoff,)) is not None:
+            self._last_cleanup = now
 
     def insert(self, payload: dict[str, Any], client: str, status: str = "pending") -> int | None:
         self.cleanup()

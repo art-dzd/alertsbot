@@ -281,7 +281,7 @@ async def health() -> dict[str, str]:
 
 @app.get("/readyz")
 async def ready() -> dict[str, str]:
-    if not history.ready():
+    if not await asyncio.to_thread(history.ready):
         raise HTTPException(status_code=503, detail="Alert history unavailable")
     return {"status": "ready"}
 
@@ -318,18 +318,18 @@ async def notify(request: Request) -> JSONResponse:
                 except (ValueError, UnicodeError, RecursionError):
                     pass
             if too_large:
-                row_id = history.insert({}, client, "rejected")
+                row_id = await asyncio.to_thread(history.insert, {}, client, "rejected")
                 result = NotifyResult(413, {"detail": "Body too large"}, "body_too_large")
                 outcome = "rejected"
             elif not isinstance(data, dict):
-                row_id = history.insert({}, client, "rejected")
+                row_id = await asyncio.to_thread(history.insert, {}, client, "rejected")
                 result = NotifyResult(
                     422, {"detail": "Expected JSON object"}, "invalid_json_object"
                 )
                 outcome = "rejected"
             else:
                 payload, reasons = normalize_payload(data)
-                row_id = history.insert(payload.model_dump(), client)
+                row_id = await asyncio.to_thread(history.insert, payload.model_dump(), client)
                 if row_id is None:
                     reasons.append("database_failure")
                 result = await _send_notify_once_per_event(payload, stats)
@@ -358,7 +358,8 @@ async def notify(request: Request) -> JSONResponse:
     finally:
         reason = ";".join(filter(None, [result.reason, *reasons]))
         if row_id is not None:
-            updated = history.finish(
+            updated = await asyncio.to_thread(
+                history.finish,
                 row_id,
                 "rejected"
                 if outcome == "rejected"
