@@ -9,10 +9,10 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 import httpx
@@ -43,6 +43,7 @@ BODY_MAX_BYTES = 1024 * 1024
 IDEMPOTENCY_TTL_SECONDS = 3600.0
 IDEMPOTENCY_MAX_RECORDS = 10_000
 CACHEABLE_ERROR_STATUS_CODES = frozenset({422, 424})
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +224,15 @@ def _remember_notify_result(event_id: str, result: NotifyResult) -> None:
     )
 
 
+async def _history_write(operation: Callable[..., T], *args: Any) -> tuple[T, bool]:
+    """Доводит запись истории до конца, даже если запрос отменили."""
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(task), False
+    except asyncio.CancelledError:
+        return await task, True
+
+
 async def _send_notify(payload: NotifyRequest, stats: DeliveryStats) -> NotifyResult:
     started = time.monotonic()
     try:
@@ -318,18 +328,26 @@ async def notify(request: Request) -> JSONResponse:
                 except (ValueError, UnicodeError, RecursionError):
                     pass
             if too_large:
-                row_id = await asyncio.to_thread(history.insert, {}, client, "rejected")
+                row_id, cancelled = await _history_write(history.insert, {}, client, "rejected")
+                if cancelled:
+                    raise asyncio.CancelledError
                 result = NotifyResult(413, {"detail": "Body too large"}, "body_too_large")
                 outcome = "rejected"
             elif not isinstance(data, dict):
-                row_id = await asyncio.to_thread(history.insert, {}, client, "rejected")
+                row_id, cancelled = await _history_write(history.insert, {}, client, "rejected")
+                if cancelled:
+                    raise asyncio.CancelledError
                 result = NotifyResult(
                     422, {"detail": "Expected JSON object"}, "invalid_json_object"
                 )
                 outcome = "rejected"
             else:
                 payload, reasons = normalize_payload(data)
-                row_id = await asyncio.to_thread(history.insert, payload.model_dump(), client)
+                row_id, cancelled = await _history_write(
+                    history.insert, payload.model_dump(), client
+                )
+                if cancelled:
+                    raise asyncio.CancelledError
                 if row_id is None:
                     reasons.append("database_failure")
                 result = await _send_notify_once_per_event(payload, stats)
@@ -358,7 +376,7 @@ async def notify(request: Request) -> JSONResponse:
     finally:
         reason = ";".join(filter(None, [result.reason, *reasons]))
         if row_id is not None:
-            updated = await asyncio.to_thread(
+            updated, _ = await _history_write(
                 history.finish,
                 row_id,
                 "rejected"

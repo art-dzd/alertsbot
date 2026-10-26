@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from types import TracebackType
-from typing import Any
 
-from pytest import MonkeyPatch
+from pytest import LogCaptureFixture, MonkeyPatch
 
 from alertsbot import history
 
@@ -49,92 +49,56 @@ def test_retention_at_startup_and_at_most_hourly(monkeypatch: MonkeyPatch, tmp_p
         assert db.execute("SELECT count(*) FROM alerts WHERE created_at='2000'").fetchone() == (0,)
 
 
-def test_history_recovers_after_database_file_removed(tmp_path: Path) -> None:
+def test_schema_retries_only_after_sqlite_error(
+    tmp_path: Path, caplog: LogCaptureFixture
+) -> None:
     path = tmp_path / "history.db"
     store = history.History(str(path))
     assert store.insert({"message": "first"}, "test") is not None
 
     path.unlink()
+    assert store.insert({"message": "second"}, "test") is None
+    assert any(getattr(record, "event", None) == "history_error" for record in caplog.records)
 
-    assert store.insert({"message": "second"}, "test") is not None
-
-
-def test_history_recovers_after_database_file_truncated(tmp_path: Path) -> None:
-    path = tmp_path / "history.db"
-    store = history.History(str(path))
-    assert store.insert({"message": "first"}, "test") is not None
-
-    path.write_bytes(b"")
-
-    assert store.insert({"message": "second"}, "test") is not None
+    assert store.insert({"message": "third"}, "test") is not None
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT count(*) FROM alerts").fetchone() == (1,)
 
 
-class RecordingConnection:
-    def __init__(self, connection: sqlite3.Connection, scripts: list[str]) -> None:
-        self._connection = connection
-        self._scripts = scripts
-
-    def executescript(self, script: str) -> sqlite3.Cursor:
-        self._scripts.append(script)
-        return self._connection.executescript(script)
-
-    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Cursor:
-        return self._connection.execute(sql, parameters)
-
-    def __enter__(self) -> RecordingConnection:
-        self._connection.__enter__()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> bool | None:
-        return self._connection.__exit__(exc_type, exc, tb)
-
-    def close(self) -> None:
-        self._connection.close()
-
-
-def test_schema_is_created_once(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
-    real_connect = sqlite3.connect
-    scripts: list[str] = []
-
-    def connect(*args: Any, **kwargs: Any) -> RecordingConnection:
-        return RecordingConnection(real_connect(*args, **kwargs), scripts)
-
-    monkeypatch.setattr("alertsbot.history.sqlite3.connect", connect)
-    store = history.History(str(tmp_path / "history.db"))
-
-    assert store.insert({"message": "first"}, "test") is not None
-    assert store.insert({"message": "second"}, "test") is not None
-    assert len(scripts) == 1
-
-
-def test_cleanup_time_advances_only_after_success(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
-    store = history.History(str(tmp_path / "history.db"))
+def test_cleanup_failure_is_not_retried_before_interval(
+    monkeypatch: MonkeyPatch, tmp_path: Path, caplog: LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="alertsbot.history")
     now = 1000.0
     monkeypatch.setattr("alertsbot.history.time.monotonic", lambda: now)
-    calls = 0
-
-    def fail(sql: str, parameters: tuple[Any, ...] = ()) -> None:
-        nonlocal calls
-        calls += 1
-        return None
-
-    def success(sql: str, parameters: tuple[Any, ...] = ()) -> int:
-        nonlocal calls
-        calls += 1
-        return 0
-
-    monkeypatch.setattr(store, "_execute", fail)
-    store.cleanup()
-    assert calls == 1
-
-    monkeypatch.setattr(store, "_execute", success)
-    store.cleanup()
-    assert calls == 2
+    store = history.History(str(tmp_path / "missing" / "history.db"))
 
     store.cleanup()
-    assert calls == 2
+    store.cleanup()
+
+    errors = [
+        record for record in caplog.records if getattr(record, "event", None) == "history_error"
+    ]
+    assert len(errors) == 1
+
+
+def test_parallel_writes_do_not_lose_rows(tmp_path: Path, caplog: LogCaptureFixture) -> None:
+    caplog.set_level(logging.ERROR, logger="alertsbot.history")
+    path = tmp_path / "history.db"
+    store = history.History(str(path))
+    count = 32
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        row_ids = list(
+            pool.map(
+                lambda index: store.insert({"message": f"message-{index}"}, "test"),
+                range(count),
+            )
+        )
+
+    assert all(row_id is not None for row_id in row_ids)
+    assert not [
+        record for record in caplog.records if getattr(record, "event", None) == "history_error"
+    ]
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT count(*) FROM alerts").fetchone() == (count,)

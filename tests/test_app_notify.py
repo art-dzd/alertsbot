@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import sqlite3
 import sys
 import threading
 from collections.abc import Iterator, Sequence
@@ -17,6 +18,7 @@ from fastapi.testclient import TestClient
 from pytest import LogCaptureFixture, MonkeyPatch
 
 from alertsbot.config import get_settings
+from alertsbot.history import History
 from alertsbot.telegram import TelegramPayloadError, TelegramPermanentError, TelegramRateLimitError
 
 
@@ -1075,3 +1077,51 @@ def test_slow_history_insert_does_not_block_second_notify_or_health(
         finally:
             release_insert.set()
         assert first.result(timeout=5).status_code == 200
+
+
+def test_cancelled_notify_finishes_history_row(
+    monkeypatch: MonkeyPatch, notify_app: tuple[Any, TestClient], tmp_path: Path
+) -> None:
+    app_module, _ = notify_app
+    store = History(str(tmp_path / "cancel.db"))
+    real_insert = store.insert
+    insert_started = threading.Event()
+    release_insert = threading.Event()
+    sent = False
+
+    def slow_insert(
+        payload: dict[str, Any], client: str, status: str = "pending"
+    ) -> int | None:
+        insert_started.set()
+        assert release_insert.wait(5)
+        return real_insert(payload, client, status)
+
+    async def fake_send(*args: object, **kwargs: object) -> str:
+        nonlocal sent
+        sent = True
+        return ""
+
+    monkeypatch.setattr(store, "insert", slow_insert)
+    monkeypatch.setattr(app_module, "history", store)
+    monkeypatch.setattr(app_module, "send_message", fake_send)
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=app_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/notify",
+                    headers={"X-Alerts-Token": "shared-secret"},
+                    json=sample_payload(),
+                )
+            )
+            assert await asyncio.to_thread(insert_started.wait, 2)
+            request.cancel()
+            release_insert.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+    asyncio.run(scenario())
+    assert sent is False
+    with sqlite3.connect(str(tmp_path / "cancel.db")) as db:
+        assert db.execute("SELECT status, http_status FROM alerts").fetchone() == ("failed", 499)

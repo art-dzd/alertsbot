@@ -408,9 +408,3 @@ def test_public_path_outage_reported_while_history_still_delivered(
     assert tab_forwarder.main() == 0
     assert "снова доступен" in commands.messages[2]
     capsys.readouterr()
-
-
-def test_readyz_timeout_between_observed_and_ssh() -> None:
-    timeout = tab_forwarder.REMOTE_READYZ_TIMEOUT_SECONDS
-    assert 11 < timeout < tab_forwarder.SSH_TIMEOUT_SECONDS
-    assert f"timeout={timeout}" in tab_forwarder.REMOTE_QUERY

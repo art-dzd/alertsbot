@@ -23,9 +23,10 @@ MESSAGE_PREVIEW_LIMIT = 300
 MESSAGE_LIMIT = 6000
 MOSCOW = timezone(timedelta(hours=3))
 # Худший проход (два ssh-маршрута, внешний readyz, два tpanel) укладывается в TimeoutStartSec=90s.
-SSH_TIMEOUT_SECONDS = 15
-# 26.10 /readyz отвечал ~11 с; таймаут больше него и меньше SSH_TIMEOUT_SECONDS.
+# 26.10 /readyz отвечал ~11 с; SSH-таймаут — readyz плюс запас.
 REMOTE_READYZ_TIMEOUT_SECONDS = 12
+SSH_TIMEOUT_MARGIN_SECONDS = 3
+SSH_TIMEOUT_SECONDS = REMOTE_READYZ_TIMEOUT_SECONDS + SSH_TIMEOUT_MARGIN_SECONDS
 PUBLIC_TIMEOUT_SECONDS = 10
 TPANEL_TIMEOUT_SECONDS = 20
 # Этим путём шлют vpn, hr, gitea; его поломку при живом alertsbot иначе не видит никто.
