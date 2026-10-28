@@ -1,0 +1,2 @@
+# Только фиксированное чтение истории, без отключения аудита других команд.
+Defaults!/usr/local/libexec/alertsbot-read-history !log_allowed, !pam_session

@@ -125,7 +125,7 @@ jobs:
           test "$(sudo systemctl show alertsbot -p InvocationID --value)" = "$NEW_INVOCATION"
           RELEASE_VERSION="$(sudo -u alertsbot git rev-parse --short=12 HEAD)"
           sudo journalctl --sync
-          sudo journalctl "_SYSTEMD_INVOCATION_ID=$NEW_INVOCATION" --no-pager -o cat |
+          sudo journalctl --file="/var/log/journal/$(cat /etc/machine-id)/system.journal" "_SYSTEMD_INVOCATION_ID=$NEW_INVOCATION" --no-pager -o cat |
             python3 scripts/check_startup.py "$RELEASE_VERSION"
 
           trap - ERR
@@ -134,5 +134,5 @@ jobs:
       - name: Logs on failure
         if: failure()
         run: |
-          sudo systemctl status alertsbot --no-pager -l || true
-          sudo journalctl -u alertsbot --since "5 minutes ago" --no-pager || true
+          sudo systemctl status alertsbot --no-pager -l --no-legend --lines=0 || true
+          sudo journalctl --file="/var/log/journal/$(cat /etc/machine-id)/system.journal" -u alertsbot --since "5 minutes ago" --no-pager || true

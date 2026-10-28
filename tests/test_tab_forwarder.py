@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import runpy
 import shlex
 import sqlite3
 import subprocess
@@ -304,19 +305,21 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
     assert tab_forwarder.main() == 0
     capsys.readouterr()
     remote = shlex.split(commands.calls[0][-1])
-    assert remote[:5] == ["sudo", "-n", "-u", "alertsbot", "python3"]
-    assert remote[5] == "-c"
-    monkeypatch.setattr(sys, "argv", ["-c", remote[7]])
-    exec(compile(remote[6], "remote_query", "exec"), {})
+    assert remote[:5] == [
+        "sudo", "-n", "-u", "alertsbot", "/usr/local/libexec/alertsbot-read-history",
+    ]
+    script = Path(__file__).resolve().parents[1] / "scripts" / "read_history.py"
+    monkeypatch.setattr(sys, "argv", [str(script), remote[5]])
+    runpy.run_path(str(script), run_name="__main__")
     data = json.loads(capsys.readouterr().out)
     assert [row["id"] for row in data["rows"]] == list(range(3, 103))
 
-    monkeypatch.setattr(sys, "argv", ["-c", "init"])
-    exec(compile(remote[6], "remote_query", "exec"), {})
+    monkeypatch.setattr(sys, "argv", [str(script), "init"])
+    runpy.run_path(str(script), run_name="__main__")
     assert json.loads(capsys.readouterr().out) == {"max_id": 105, "rows": [], "reset": False}
 
-    monkeypatch.setattr(sys, "argv", ["-c", "500"])
-    exec(compile(remote[6], "remote_query", "exec"), {})
+    monkeypatch.setattr(sys, "argv", [str(script), "500"])
+    runpy.run_path(str(script), run_name="__main__")
     data = json.loads(capsys.readouterr().out)
     assert data["reset"] is True
     assert [row["id"] for row in data["rows"]] == list(range(1, 101))

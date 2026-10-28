@@ -70,6 +70,7 @@ Journald должен сохранять рабочие логи минимум 
 
 `scripts/tab_forwarder.py` раз в минуту от пользователя server читает историю с mts
 по ssh (сначала напрямую по tailnet, при недоступности — через vpn) и SQLite `mode=ro`;
+на mts фиксированную команду чтения и отдельное правило sudo ставит `install_units.sh`.
 отправляет одну сводку через `tpanel say`. Перед чтением проверяет `readyz` alertsbot
 на mts, после — внешний путь `https://aiomc.ru/alerts/readyz` (им шлют vpn, hr, gitea):
 канал (mts, alertsbot, история или внешний путь) недоступен дольше 3 минут — одно сообщение

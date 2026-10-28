@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import tempfile
 import time
@@ -37,40 +36,6 @@ ALERTSBOT_NOT_READY = 3
 # Сначала напрямую по tailnet, чтобы не зависеть от vpn; запасной путь — ProxyJump из ~/.ssh/config.
 SSH_ROUTES = (("-o", "ProxyJump=none", "-o", "HostName=100.89.26.10"), ())
 VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
-REMOTE_QUERY = f"""
-import json
-import sqlite3
-import sys
-import urllib.request
-from contextlib import closing
-
-try:
-    urllib.request.urlopen(
-        'http://127.0.0.1:9100/readyz',
-        timeout={REMOTE_READYZ_TIMEOUT_SECONDS},
-    ).close()
-except Exception:
-    sys.exit({ALERTSBOT_NOT_READY})
-
-with closing(sqlite3.connect(
-    'file:/var/lib/alertsbot/alerts.db?mode=ro', uri=True, timeout=5
-)) as db:
-    db.row_factory = sqlite3.Row
-    maximum = db.execute('SELECT COALESCE(MAX(id), 0) FROM alerts').fetchone()[0]
-    rows = []
-    reset = False
-    if sys.argv[1] != 'init':
-        cursor = int(sys.argv[1])
-        # Файл истории пересоздали — id пошли заново, читаем с начала.
-        reset = cursor > maximum
-        rows = [dict(row) for row in db.execute(
-            'SELECT id, created_at, service, title, message, status, http_status, reason, cached '
-            'FROM alerts WHERE id > ? ORDER BY id LIMIT ?',
-            (0 if reset else cursor, {BATCH_LIMIT})
-        )]
-    print(json.dumps({{'max_id': maximum, 'rows': rows, 'reset': reset}}, ensure_ascii=True))
-"""
-
 
 class Alert(TypedDict):
     id: int
@@ -95,7 +60,7 @@ def parse_time(value: str) -> datetime:
 def fetch_history(last_id: int | None) -> tuple[int, list[Alert], bool, int]:
     """Возвращает max(id), новые строки, признак сброса id и номер ssh-маршрута."""
     cursor = "init" if last_id is None else str(last_id)
-    command = f"sudo -n -u alertsbot python3 -c {shlex.quote(REMOTE_QUERY)} {cursor}"
+    command = f"sudo -n -u alertsbot /usr/local/libexec/alertsbot-read-history {cursor}"
     for route_index, route in enumerate(SSH_ROUTES):
         try:
             response = subprocess.run(

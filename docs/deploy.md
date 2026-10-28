@@ -12,7 +12,7 @@ CI держит отдельный venv и под flock выполняет:
 2. `scripts/install_units.sh`: юниты (сервис и сокет), daemon-reload, restart.
 3. Запоминает InvocationID нового запуска, проверяет health (до 10 попыток), active
    и отсутствие перезапуска между проверками.
-4. Читает только журнал нового InvocationID. `scripts/check_startup.py` требует
+4. Читает текущий файл журнала и только записи нового InvocationID. `scripts/check_startup.py` требует
    корректный JSON, `startup` с целевой версией и отсутствие ERROR/CRITICAL до startup.
    Версия в приложении и CI — `git rev-parse --short=12 HEAD`.
 5. Любой сбой вызывает откат: предыдущий git HEAD и зависимости, его `install_units.sh`,
@@ -85,7 +85,9 @@ journalctl -u alerts-tab-forwarder -n 100 --no-pager -o cat
 
 Пользователю server должны быть доступны SSH-ключ и алиас `mts`, бинарь
 `/usr/local/bin/tpanel` и его `~/.config/tpanel/api.env`. На mts требуется
-беспарольный `sudo -n -u alertsbot python3` для чтения истории. Каталог
+беспарольный `sudo -n -u alertsbot /usr/local/libexec/alertsbot-read-history` для чтения истории.
+`install_units.sh` устанавливает root-владеющий скрипт и правило sudo, которое отключает
+журналирование только этой команды. Остальные sudo-команды журналируются как прежде. Каталог
 `/var/lib/prometheus/node-exporter` должен уже существовать и собираться
 textfile-коллектором node-exporter.
 
