@@ -43,6 +43,7 @@ class Commands:
         self.ssh_codes: list[int] = []
         self.reset = False
         self.public_ok = True
+        self.telegram_route: dict[str, Any] | None = {"value": "1", "age_seconds": 10}
         self.now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
         self.tpanel_code = 0
         self.calls: list[list[str]] = []
@@ -60,7 +61,10 @@ class Commands:
             result = subprocess.CompletedProcess(
                 command,
                 code,
-                json.dumps({"max_id": self.max_id, "rows": self.rows, "reset": self.reset}),
+                json.dumps({
+                    "max_id": self.max_id, "rows": self.rows, "reset": self.reset,
+                    "telegram_route": self.telegram_route,
+                }),
             )
             if kwargs.get("check"):
                 result.check_returncode()
@@ -301,6 +305,19 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
 
     monkeypatch.setattr(sqlite3, "connect", readonly_connect)
     monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout: io.BytesIO())
+    route_file = tmp_path / "telegram_proxy.prom"
+    route_file.write_text(
+        '# TYPE telegram_route_up gauge\ntelegram_route_up{route="haproxy"} 1\n'
+        'telegram_route_up{route="alertsbot"} 0\n'
+    )
+    real_open = open
+
+    def route_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if file == "/var/lib/node_exporter/textfile_collector/telegram_proxy.prom":
+            file = route_file
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", route_open)
     (tmp_path / "last_id").write_text("2\n")
     assert tab_forwarder.main() == 0
     capsys.readouterr()
@@ -313,10 +330,14 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
     runpy.run_path(str(script), run_name="__main__")
     data = json.loads(capsys.readouterr().out)
     assert [row["id"] for row in data["rows"]] == list(range(3, 103))
+    assert tab_forwarder.telegram_route_up(data["telegram_route"]) is False
 
     monkeypatch.setattr(sys, "argv", [str(script), "init"])
+    route_file.unlink()
     runpy.run_path(str(script), run_name="__main__")
-    assert json.loads(capsys.readouterr().out) == {"max_id": 105, "rows": [], "reset": False}
+    assert json.loads(capsys.readouterr().out) == {
+        "max_id": 105, "rows": [], "reset": False, "telegram_route": None,
+    }
 
     monkeypatch.setattr(sys, "argv", [str(script), "500"])
     runpy.run_path(str(script), run_name="__main__")
@@ -411,3 +432,31 @@ def test_public_path_outage_reported_while_history_still_delivered(
     assert tab_forwarder.main() == 0
     assert "снова доступен" in commands.messages[2]
     capsys.readouterr()
+
+
+def test_telegram_route_outage_reported_once_and_recovery(
+    commands: Commands, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.telegram_route = {"value": "0", "age_seconds": 10}
+    assert tab_forwarder.main() == 0
+    assert commands.messages == []
+    assert json.loads(capsys.readouterr().out)["reason"] == "telegram_down"
+
+    commands.now = commands.now.replace(minute=3)
+    assert tab_forwarder.main() == 0
+    assert len(commands.messages) == 1
+    assert "не может отправить в Telegram" in commands.messages[0]
+    assert "14.10 15:00 МСК" in commands.messages[0]
+    capsys.readouterr()
+
+    # Устаревшие данные монитора сбой не закрывают.
+    commands.telegram_route = {"value": "1", "age_seconds": 600}
+    assert tab_forwarder.main() == 0
+    assert len(commands.messages) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == "telegram_route_unknown"
+
+    commands.telegram_route = {"value": "1", "age_seconds": 10}
+    assert tab_forwarder.main() == 0
+    assert "Telegram снова принимает алерты" in commands.messages[1]
+    assert not (tmp_path / "telegram_outage").exists()
