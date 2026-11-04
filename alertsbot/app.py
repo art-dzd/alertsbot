@@ -10,8 +10,9 @@ import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 from uuid import uuid4
 
@@ -43,6 +44,10 @@ BODY_MAX_BYTES = 1024 * 1024
 IDEMPOTENCY_TTL_SECONDS = 3600.0
 IDEMPOTENCY_MAX_RECORDS = 10_000
 CACHEABLE_ERROR_STATUS_CODES = frozenset({422, 424})
+REDELIVERY_INTERVAL_SECONDS = 60
+REDELIVERY_MAX_AGE = timedelta(hours=24)
+REDELIVERY_BATCH_SIZE = 10
+MOSCOW = timezone(timedelta(hours=3))
 T = TypeVar("T")
 
 
@@ -93,6 +98,8 @@ history = History(settings.db_path)
 _idempotency_records: dict[str, IdempotencyRecord] = {}
 _idempotency_locks: dict[str, EventLockEntry] = {}
 _idempotency_index_lock = asyncio.Lock()
+_redelivery_finished: set[int] = set()
+_redelivery_attempts: dict[int, int] = {}
 
 
 @asynccontextmanager
@@ -102,9 +109,17 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
     if VERSION == "unknown":
         logger.error("Версия выпуска неизвестна", extra={"event": "version_unavailable"})
     logger.info("Сервис запущен", extra={"event": "startup"})
+    _redelivery_finished.clear()
+    _redelivery_attempts.clear()
+    redelivery_task = asyncio.create_task(_redelivery_loop())
     try:
         yield
     finally:
+        redelivery_task.cancel()
+        try:
+            await redelivery_task
+        except asyncio.CancelledError:
+            pass
         await fastapi_app.state.telegram_client_pool.aclose()
 
 
@@ -173,8 +188,8 @@ def _alert_text(payload: NotifyRequest) -> str:
     return text
 
 
-def format_alert(payload: NotifyRequest) -> str:
-    text = _alert_text(payload)
+def format_alert(payload: NotifyRequest, prefix: str = "") -> str:
+    text = prefix + _alert_text(payload)
     if len(text) <= TELEGRAM_MESSAGE_LIMIT:
         return text
     return text[: TELEGRAM_MESSAGE_LIMIT - len(TRUNCATION_NOTICE)] + TRUNCATION_NOTICE
@@ -233,13 +248,15 @@ async def _history_write(operation: Callable[..., T], *args: Any) -> tuple[T, bo
         return await task, True
 
 
-async def _send_notify(payload: NotifyRequest, stats: DeliveryStats) -> NotifyResult:
+async def _send_notify(
+    payload: NotifyRequest, stats: DeliveryStats, prefix: str = ""
+) -> NotifyResult:
     started = time.monotonic()
     try:
         await send_message(
             settings.alerts_bot_token,
             settings.alerts_chat_id,
-            format_alert(payload),
+            format_alert(payload, prefix),
             settings.telegram_proxy_sequence,
             settings.telegram_proxy_circuit_breaker_seconds,
             client_pool=app.state.telegram_client_pool,
@@ -266,6 +283,105 @@ async def _send_notify(payload: NotifyRequest, stats: DeliveryStats) -> NotifyRe
     finally:
         stats.telegram_ms = round((time.monotonic() - started) * 1000, 3)
     return NotifyResult(200, {"status": "sent"}, telegram_status=stats.status, sent_at=utc_now())
+
+
+async def _redeliver_row(row: dict[str, Any], now: datetime) -> int | None:
+    row_id: int = row["id"]
+    event_id: str | None = row["event_id"]
+    payload = NotifyRequest(**{key: row[key] for key in (
+        "service", "title", "message", "details", "event_id"
+    )})
+    created_at = datetime.fromisoformat(row["created_at"])
+    stats = DeliveryStats()
+    key = _event_key(event_id) if event_id is not None else None
+
+    result: NotifyResult | None = None
+    updated = True
+    async with (_hold_event_lock(key) if key is not None else nullcontext()):
+        cached = _idempotency_records.get(key) if key is not None else None
+        if cached is not None and cached.expires_at > time.monotonic():
+            _redelivery_finished.add(row_id)
+        else:
+            _redelivery_attempts[row_id] = _redelivery_attempts.get(row_id, 0) + 1
+            local_time = created_at.astimezone(MOSCOW)
+            prefix = f"Доставлено с опозданием: алерт от {local_time:%d.%m %H:%M} МСК\n"
+            result = await _send_notify(payload, stats, prefix)
+            if result.status_code != 502:
+                _redelivery_finished.add(row_id)
+            if result.status_code == 200:
+                if key is not None:
+                    _remember_notify_result(key, result)
+                cutoff = (now - REDELIVERY_MAX_AGE).isoformat(timespec="milliseconds")
+                updated, cancelled = await _history_write(
+                    history.mark_redelivered, row_id, result.sent_at, cutoff
+                )
+                if cancelled:
+                    raise asyncio.CancelledError
+    reason = "event_cached" if result is None else result.reason
+    outcome = "skipped" if result is None else "ok" if result.status_code == 200 else "error"
+    if result is not None and result.status_code == 200 and not updated:
+        outcome, reason = "fallback", "database_failure"
+    level = logging.WARNING if outcome == "fallback" or (
+        result is not None and result.status_code == 502
+    ) else logging.ERROR if outcome == "error" else logging.INFO
+    logger.log(level, "Досылка алерта завершена", extra={
+        "event": "redelivery_done", "fields": {
+            "outcome": outcome, "reason": reason, "history_id": row_id,
+            "event_id": _logged_event_id(event_id),
+            "alert_service": payload.service[:SERVICE_MAX_LENGTH],
+            "attempts": stats.attempts, "telegram_ms": stats.telegram_ms, "proxy": stats.proxy,
+            "delay_seconds": max(0, (now - created_at).total_seconds()),
+            **exception_fields(stats.exception),
+        },
+    })
+    return result.status_code if result is not None else None
+
+
+async def _redelivery_pass() -> None:
+    now = datetime.now(timezone.utc)
+    cutoff = (now - REDELIVERY_MAX_AGE).isoformat(timespec="milliseconds")
+    rows = await asyncio.to_thread(history.redelivery_candidates, cutoff)
+    rows = [row for row in rows if row["id"] not in _redelivery_finished]
+    rows.sort(
+        key=lambda row: (_redelivery_attempts.get(row["id"], 0), row["created_at"], row["id"])
+    )
+    for row in rows[:REDELIVERY_BATCH_SIZE]:
+        if row["id"] in _redelivery_finished:
+            continue
+        try:
+            status = await _redeliver_row(row, now)
+            if status == 502:
+                break
+            if status == 200:
+                fields = ("service", "title", "message", "details")
+                for other in rows:
+                    if (row["event_id"] is not None and other["event_id"] == row["event_id"]) or (
+                        row["event_id"] is None and other["event_id"] is None
+                        and all(other[field] == row[field] for field in fields)
+                    ):
+                        _redelivery_finished.add(other["id"])
+        except Exception as error:
+            # Одна строка не должна держать досылку остальных каждую минуту.
+            _redelivery_finished.add(row["id"])
+            logger.error("Строку истории не удалось дослать", extra={
+                "event": "redelivery_error", "fields": {
+                    "reason": "redelivery_row_failed", "history_id": row["id"],
+                    **exception_fields(error),
+                },
+            })
+
+
+async def _redelivery_loop() -> None:
+    while True:
+        await asyncio.sleep(REDELIVERY_INTERVAL_SECONDS)
+        try:
+            await _redelivery_pass()
+        except Exception as error:
+            logger.error("Ошибка прохода досылки", extra={
+                "event": "redelivery_error", "fields": {
+                    "reason": "redelivery_pass_failed", **exception_fields(error),
+                },
+            })
 
 
 async def _send_notify_once_per_event(payload: NotifyRequest, stats: DeliveryStats) -> NotifyResult:

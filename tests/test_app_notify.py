@@ -1125,3 +1125,324 @@ def test_cancelled_notify_finishes_history_row(
     assert sent is False
     with sqlite3.connect(str(tmp_path / "cancel.db")) as db:
         assert db.execute("SELECT status, http_status FROM alerts").fetchone() == ("failed", 499)
+
+
+@pytest.fixture
+def redelivery_setup(monkeypatch: MonkeyPatch, notify_app: tuple[Any, TestClient]) -> Any:
+    from datetime import datetime, timezone
+
+    app_module, client = notify_app
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> FrozenDatetime:
+            return cls(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(app_module, "datetime", FrozenDatetime)
+
+    def add_row(
+        event_id: str | None = None,
+        created_at: str = "2026-01-02T11:30:00.000+00:00",
+        status: str = "failed",
+        http_status: int = 502,
+        message: str = "упало",
+    ) -> int:
+        with sqlite3.connect(app_module.history.path) as db:
+            cursor = db.execute(
+                """INSERT INTO alerts (created_at, service, title, message, event_id, client,
+                status, http_status, reason) VALUES (?, 'billing', 'ошибка', ?, ?, 'test', ?, ?,
+                'telegram_temporary_error')""",
+                (created_at, message, event_id, status, http_status),
+            )
+            assert cursor.lastrowid is not None
+            return cursor.lastrowid
+
+    assert client.portal is not None
+    return app_module, client, add_row
+
+
+def test_redelivery_success_and_cached_retry(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row("event-1", message="x" * 5000)
+    messages: list[str] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        messages.append(args[2])
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    response = client.post("/notify", headers={"X-Alerts-Token": "shared-secret"},
+                           json=sample_payload() | {"event_id": "event-1"})
+    rows = history_rows(app_module)
+    assert len(messages) == 1
+    assert messages[0].startswith("Доставлено с опозданием: алерт от 02.01 14:30 МСК\nbilling\n")
+    assert len(messages[0]) == 4096 and messages[0].endswith(app_module.TRUNCATION_NOTICE)
+    assert rows[0]["status"] == "sent" and rows[0]["http_status"] == 502
+    assert rows[0]["reason"] == "telegram_temporary_error;redelivered"
+    assert rows[0]["sent_at"] is not None
+    assert response.status_code == 200 and rows[1]["cached"] == 1
+
+
+def test_redelivery_temporary_failure_stops_pass(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any, caplog: LogCaptureFixture
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row()
+    add_row()
+    calls: list[int] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        calls.append(1)
+        raise httpx.ConnectError("secret should not appear")
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    assert len(calls) == 1
+    assert [row["status"] for row in history_rows(app_module)] == ["failed", "failed"]
+    records = [r for r in caplog.records if getattr(r, "event", None) == "redelivery_done"]
+    assert len(records) == 1 and records[0].levelno == logging.WARNING
+    assert records[0].__dict__["fields"]["reason"] == "telegram_temporary_error"
+
+
+def test_redelivery_selects_only_recent_unresolved_502(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row("delivered")
+    add_row("delivered", "2026-01-02T11:31:00.000+00:00", "sent", 200)
+    add_row(created_at="2026-01-01T11:59:59.000+00:00")
+    add_row(status="sent", http_status=200)
+    add_row(status="rejected", http_status=422)
+    add_row(http_status=422)
+    add_row(http_status=424)
+    add_row("eligible")
+    messages: list[str] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        messages.append(args[2])
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    assert len(messages) == 1
+    rows = history_rows(app_module)
+    assert rows[0]["status"] == "failed" and rows[-1]["status"] == "sent"
+
+
+def test_redelivery_no_duplicate_when_history_update_fails(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any, caplog: LogCaptureFixture
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row()
+    calls: list[int] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        calls.append(1)
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    monkeypatch.setattr(app_module.history, "mark_redelivered", lambda *args: False)
+    client.portal.call(app_module._redelivery_pass)
+    client.portal.call(app_module._redelivery_pass)
+    assert len(calls) == 1 and history_rows(app_module)[0]["status"] == "failed"
+    records = [r for r in caplog.records if getattr(r, "event", None) == "redelivery_done"]
+    assert len(records) == 1 and records[0].levelno == logging.WARNING
+    assert records[0].__dict__["fields"]["outcome"] == "fallback"
+    assert records[0].__dict__["fields"]["reason"] == "database_failure"
+
+
+@pytest.mark.parametrize("event_id", ["same-event", None])
+def test_redelivery_marks_copies_across_restart(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any, event_id: str | None
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row(event_id)
+    add_row(event_id)
+    calls: list[int] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        calls.append(1)
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    app_module._redelivery_finished.clear()
+    app_module._redelivery_attempts.clear()
+    app_module._idempotency_records.clear()
+    client.portal.call(app_module._redelivery_pass)
+    rows = history_rows(app_module)
+    assert len(calls) == 1
+    assert [row["status"] for row in rows] == ["sent", "sent"]
+    assert rows[0]["cached"] == 0 and rows[1]["cached"] == 1
+    assert rows[0]["sent_at"] == rows[1]["sent_at"]
+    assert all(row["reason"].endswith(";redelivered") for row in rows)
+
+
+def test_redelivery_without_event_id_skips_later_success(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row(message="уже доставлено")
+    add_row(status="sent", http_status=200, message="уже доставлено")
+    add_row(message="другой текст")
+    messages: list[str] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        messages.append(args[2])
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    assert len(messages) == 1 and messages[0].endswith("другой текст")
+    assert [row["status"] for row in history_rows(app_module)] == ["failed", "sent", "sent"]
+
+
+def test_redelivery_batch_limit_and_fairness(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    for i in range(12):
+        add_row(message=str(i))
+    messages: list[str] = []
+    failed = True
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        nonlocal failed
+        messages.append(args[2])
+        if failed:
+            failed = False
+            raise httpx.ConnectError("temporary")
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    client.portal.call(app_module._redelivery_pass)
+    assert len(messages) == 11
+    assert messages[1].endswith("\n1")
+    assert sum(row["status"] == "sent" for row in history_rows(app_module)) == 10
+
+
+def test_redelivery_permanent_error_is_not_repeated(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row()
+    calls: list[int] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        calls.append(1)
+        raise TelegramPermanentError("private", status_code=403)
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    client.portal.call(app_module._redelivery_pass)
+    assert len(calls) == 1 and history_rows(app_module)[0]["status"] == "failed"
+
+
+def test_notify_other_event_does_not_wait_for_redelivery(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row("old-event")
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def send(*args: Any, **kwargs: Any) -> str:
+            if args[2].startswith("Доставлено с опозданием"):
+                started.set()
+                await release.wait()
+            return ""
+
+        monkeypatch.setattr(app_module, "send_message", send)
+        task = asyncio.create_task(app_module._redelivery_pass())
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_module.app),
+                                         base_url="http://test") as http:
+                response = await asyncio.wait_for(http.post(
+                    "/notify", headers={"X-Alerts-Token": "shared-secret"},
+                    json=sample_payload() | {"event_id": "new-event"},
+                ), 2)
+            assert response.status_code == 200 and not task.done()
+        finally:
+            release.set()
+            await task
+
+    client.portal.call(scenario)
+
+
+def test_redelivery_and_live_request_same_event_send_once(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row("same-event")
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        messages: list[str] = []
+        request_started = asyncio.Event()
+        original_send = app_module._send_notify_once_per_event
+
+        async def send_once(payload: Any, stats: Any) -> Any:
+            request_started.set()
+            return await original_send(payload, stats)
+
+        async def send(*args: Any, **kwargs: Any) -> str:
+            messages.append(args[2])
+            started.set()
+            await release.wait()
+            return ""
+
+        monkeypatch.setattr(app_module, "send_message", send)
+        monkeypatch.setattr(app_module, "_send_notify_once_per_event", send_once)
+        task = asyncio.create_task(app_module._redelivery_pass())
+        request_task: asyncio.Task[httpx.Response] | None = None
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app_module.app), base_url="http://test"
+            ) as http:
+                request_task = asyncio.create_task(http.post(
+                    "/notify", headers={"X-Alerts-Token": "shared-secret"},
+                    json=sample_payload() | {"event_id": "same-event"},
+                ))
+                await asyncio.wait_for(request_started.wait(), 2)
+                assert not request_task.done()
+                release.set()
+                response = await asyncio.wait_for(request_task, 2)
+                assert response.status_code == 200
+        finally:
+            release.set()
+            await task
+        assert len(messages) == 1
+        assert history_rows(app_module)[1]["cached"] == 1
+
+    client.portal.call(scenario)
+
+
+def test_redelivery_skips_broken_row_and_delivers_the_rest(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any, caplog: LogCaptureFixture
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row(created_at="2026-01-02 испорчено", message="испорченная запись")
+    add_row()
+    messages: list[str] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        messages.append(args[2])
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    client.portal.call(app_module._redelivery_pass)
+    client.portal.call(app_module._redelivery_pass)
+    assert len(messages) == 1
+    assert [row["status"] for row in history_rows(app_module)] == ["failed", "sent"]
+    errors = [r for r in caplog.records if getattr(r, "event", None) == "redelivery_error"]
+    assert len(errors) == 1 and errors[0].__dict__["fields"]["history_id"] == 1
+    assert errors[0].__dict__["fields"]["reason"] == "redelivery_row_failed"

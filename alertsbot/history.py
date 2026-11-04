@@ -44,6 +44,16 @@ class History:
         self._schema_ready = False
         self._db_lock = threading.Lock()
 
+    def _log_error(self, error: Exception) -> None:
+        if isinstance(error, sqlite3.Error):
+            self._schema_ready = False
+        logger.error(
+            "История алертов недоступна",
+            extra={"event": "history_error", "fields": {
+                "reason": "database_failure", **exception_fields(error),
+            }},
+        )
+
     def _execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> int | None:
         # lean: один доступ к SQLite за раз для ~15 отправителей, без очереди и потока.
         try:
@@ -55,19 +65,21 @@ class History:
                     cursor = connection.execute(sql, parameters)
                     return cursor.lastrowid or 0
         except (sqlite3.Error, OSError, UnicodeError) as error:
-            if isinstance(error, sqlite3.Error):
-                self._schema_ready = False
-            logger.error(
-                "История алертов недоступна",
-                extra={
-                    "event": "history_error",
-                    "fields": {
-                        "reason": "database_failure",
-                        **exception_fields(error),
-                    },
-                },
-            )
+            self._log_error(error)
             return None
+
+    def _read(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        try:
+            with self._db_lock:
+                with closing(sqlite3.connect(self.path, timeout=0.1)) as connection, connection:
+                    if not self._schema_ready:
+                        connection.executescript(SCHEMA)
+                        self._schema_ready = True
+                    connection.row_factory = sqlite3.Row
+                    return [dict(row) for row in connection.execute(sql, parameters)]
+        except (sqlite3.Error, OSError, UnicodeError) as error:
+            self._log_error(error)
+            return []
 
     def cleanup(self) -> None:
         now = time.monotonic()
@@ -120,3 +132,34 @@ class History:
 
     def ready(self) -> bool:
         return self._execute("SELECT id FROM alerts LIMIT 0") is not None
+
+    def redelivery_candidates(self, cutoff: str) -> list[dict[str, Any]]:
+        return self._read(
+            """SELECT a.* FROM alerts a
+            WHERE a.status='failed' AND a.http_status=502 AND a.created_at >= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM alerts later WHERE later.status='sent'
+                  AND (later.event_id=a.event_id OR (
+                    a.event_id IS NULL AND later.event_id IS NULL
+                    AND later.service IS a.service AND later.title IS a.title
+                    AND later.message IS a.message AND later.details IS a.details))
+                  AND (later.created_at > a.created_at OR
+                    (later.created_at = a.created_at AND later.id > a.id)))
+            ORDER BY a.created_at, a.id""",
+            (cutoff,),
+        )
+
+    def mark_redelivered(self, row_id: int, sent_at: str, cutoff: str) -> bool:
+        return self._execute(
+            """UPDATE alerts SET status='sent', sent_at=?,
+            cached=CASE WHEN id=? THEN cached ELSE 1 END,
+            reason=COALESCE(reason, '') || ';redelivered'
+            WHERE id=? OR (status='failed' AND http_status=502 AND created_at >= ?
+              AND EXISTS (SELECT 1 FROM alerts original WHERE original.id=? AND (
+                alerts.event_id=original.event_id OR (
+                  original.event_id IS NULL AND alerts.event_id IS NULL
+                  AND alerts.service IS original.service AND alerts.title IS original.title
+                  AND alerts.message IS original.message
+                  AND alerts.details IS original.details))))""",
+            (sent_at, row_id, row_id, cutoff, row_id),
+        ) is not None
