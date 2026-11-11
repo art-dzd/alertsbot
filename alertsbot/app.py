@@ -48,6 +48,8 @@ REDELIVERY_INTERVAL_SECONDS = 60
 REDELIVERY_MAX_AGE = timedelta(hours=24)
 REDELIVERY_BATCH_SIZE = 10
 MOSCOW = timezone(timedelta(hours=3))
+# Только история: строку во вкладку приносит пересыльщик, в Telegram не шлём.
+TAB_DELIVERY = "tab"
 T = TypeVar("T")
 
 
@@ -78,6 +80,7 @@ class NotifyRequest(BaseModel):
     message: str
     details: str | None = None
     event_id: str | None = None
+    tab_only: bool = False
 
 
 configure_logging("INFO")
@@ -172,7 +175,11 @@ def normalize_payload(data: dict[str, Any]) -> tuple[NotifyRequest, list[str]]:
             reasons.append(f"{field}:truncated")
     if values["event_id"] is not None and len(values["event_id"]) > EVENT_ID_MAX_LENGTH:
         reasons.append("event_id:hashed")
-    payload = NotifyRequest(**values)
+    delivery = data.get("delivery")
+    if delivery is not None and delivery != TAB_DELIVERY:
+        # Неизвестное значение не должно глушить алерт: он уходит в Telegram, как без поля.
+        reasons.append("delivery:unknown")
+    payload = NotifyRequest(**values, tab_only=delivery == TAB_DELIVERY)
     if len(_alert_text(payload)) > TELEGRAM_MESSAGE_LIMIT:
         reasons.append("telegram_text:truncated")
     return payload, reasons
@@ -251,6 +258,8 @@ async def _history_write(operation: Callable[..., T], *args: Any) -> tuple[T, bo
 async def _send_notify(
     payload: NotifyRequest, stats: DeliveryStats, prefix: str = ""
 ) -> NotifyResult:
+    if payload.tab_only:
+        return NotifyResult(200, {"status": "sent"}, "tab_only", sent_at=utc_now())
     started = time.monotonic()
     try:
         await send_message(
@@ -385,7 +394,8 @@ async def _redelivery_loop() -> None:
 
 
 async def _send_notify_once_per_event(payload: NotifyRequest, stats: DeliveryStats) -> NotifyResult:
-    if payload.event_id is None:
+    # Кэш только для Telegram: tab-строка не должна сойти за доставку алерта с тем же event_id.
+    if payload.event_id is None or payload.tab_only:
         return await _send_notify(payload, stats)
     key = _event_key(payload.event_id)
     async with _hold_event_lock(key):
@@ -466,7 +476,11 @@ async def notify(request: Request) -> JSONResponse:
                     raise asyncio.CancelledError
                 if row_id is None:
                     reasons.append("database_failure")
-                result = await _send_notify_once_per_event(payload, stats)
+                if payload.tab_only and row_id is None:
+                    # Для tab история — единственный носитель: о потере должен узнать отправитель.
+                    result = NotifyResult(503, {"detail": "History unavailable"})
+                else:
+                    result = await _send_notify_once_per_event(payload, stats)
                 outcome = (
                     "error" if result.status_code >= 400 else "skipped" if stats.cached else "ok"
                 )

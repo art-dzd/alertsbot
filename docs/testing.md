@@ -28,6 +28,8 @@ Quality gate: pytest, ruff, mypy. Целевая версия Python 3.10 (prod/
 - Telegram-заглушка проверяет URL и JSON sendMessage; ошибки 400/4xx/5xx/429,
   прокси, breaker, повторные попытки и переиспользование клиентов.
 - event_id: последовательные/параллельные повторы, TTL, вытеснение, повтор после 502.
+- `delivery: "tab"`: без Telegram, `sent`/`tab_only`, не глушит алерт и досылку с тем же event_id,
+  отказ истории — 503; неизвестное значение — Telegram и WARNING `delivery:unknown`.
 - JSON-формат, безопасные ошибки, request_id, startup, ровно один notify_done,
   отсутствие дублирующего access/успешных health-логов.
 - Post-check CI отклоняет отсутствие целевого startup, ERROR/CRITICAL и не-JSON до startup.

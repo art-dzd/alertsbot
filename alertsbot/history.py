@@ -139,6 +139,7 @@ class History:
             WHERE a.status='failed' AND a.http_status=502 AND a.created_at >= ?
               AND NOT EXISTS (
                 SELECT 1 FROM alerts later WHERE later.status='sent'
+                  AND COALESCE(later.reason, '') NOT LIKE 'tab_only%'
                   AND (later.event_id=a.event_id OR (
                     a.event_id IS NULL AND later.event_id IS NULL
                     AND later.service IS a.service AND later.title IS a.title

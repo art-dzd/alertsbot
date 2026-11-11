@@ -857,6 +857,81 @@ def test_missing_and_non_string_fields_are_delivered_with_warning(
     assert "title:missing" in vars(done[0])["fields"]["reason"]
 
 
+def test_tab_delivery_skips_telegram_and_does_not_shadow_alert(
+    monkeypatch: MonkeyPatch, notify_app: tuple[Any, TestClient]
+) -> None:
+    app_module, client = notify_app
+    messages: list[str] = []
+
+    async def send(token: str, chat: str, text: str, *args: object, **kwargs: object) -> str:
+        messages.append(text)
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    payload = sample_payload() | {"event_id": "review:42:7"}
+    headers = {"X-Alerts-Token": "shared-secret"}
+    tab = client.post("/notify", headers=headers, json=payload | {"delivery": "tab"})
+    alert = client.post("/notify", headers=headers, json=payload)
+    assert tab.status_code == 200 and tab.json() == {"status": "sent"}
+    assert alert.status_code == 200
+    assert messages == ["billing\nошибка\nупало"]
+    rows = history_rows(app_module)
+    assert [(row["status"], row["reason"], row["cached"]) for row in rows] == [
+        ("sent", "tab_only", 0),
+        ("sent", "", 0),
+    ]
+
+
+def test_tab_delivery_reports_lost_row_when_history_fails(
+    monkeypatch: MonkeyPatch, notify_app: tuple[Any, TestClient], caplog: LogCaptureFixture
+) -> None:
+    app_module, client = notify_app
+    calls = 0
+
+    async def send(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    app_module.history.path = str(Path(app_module.history.path).parent)
+    response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload() | {"delivery": "tab"},
+    )
+    assert response.status_code == 503 and calls == 0
+    done = [r for r in caplog.records if getattr(r, "event", None) == "notify_done"]
+    assert len(done) == 1 and done[0].levelno == logging.ERROR
+    assert vars(done[0])["fields"]["reason"] == "database_failure"
+
+
+def test_unknown_delivery_still_goes_to_telegram_with_warning(
+    monkeypatch: MonkeyPatch,
+    notify_app: tuple[Any, TestClient],
+    caplog: LogCaptureFixture,
+) -> None:
+    app_module, client = notify_app
+    messages: list[str] = []
+
+    async def send(token: str, chat: str, text: str, *args: object, **kwargs: object) -> str:
+        messages.append(text)
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload() | {"delivery": "tabs"},
+    )
+    assert response.status_code == 200
+    assert messages == ["billing\nошибка\nупало"]
+    done = [r for r in caplog.records if getattr(r, "event", None) == "notify_done"]
+    assert len(done) == 1
+    assert done[0].levelno == logging.WARNING
+    assert vars(done[0])["fields"]["reason"] == "delivery:unknown"
+
+
 def test_long_event_ids_do_not_merge_and_history_keeps_full_text(
     monkeypatch: MonkeyPatch,
     notify_app: tuple[Any, TestClient],
@@ -1184,6 +1259,29 @@ def test_redelivery_success_and_cached_retry(
     assert rows[0]["reason"] == "telegram_temporary_error;redelivered"
     assert rows[0]["sent_at"] is not None
     assert response.status_code == 200 and rows[1]["cached"] == 1
+
+
+def test_redelivery_is_not_blocked_by_tab_row_with_same_event_id(
+    monkeypatch: MonkeyPatch, redelivery_setup: Any
+) -> None:
+    app_module, client, add_row = redelivery_setup
+    add_row("review:42:7")
+    messages: list[str] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        messages.append(args[2])
+        return ""
+
+    monkeypatch.setattr(app_module, "send_message", send)
+    response = client.post(
+        "/notify",
+        headers={"X-Alerts-Token": "shared-secret"},
+        json=sample_payload() | {"event_id": "review:42:7", "delivery": "tab"},
+    )
+    assert response.status_code == 200
+    client.portal.call(app_module._redelivery_pass)
+    assert len(messages) == 1 and messages[0].startswith("Доставлено с опозданием")
+    assert history_rows(app_module)[0]["status"] == "sent"
 
 
 def test_redelivery_temporary_failure_stops_pass(
