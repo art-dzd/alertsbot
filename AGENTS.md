@@ -106,6 +106,8 @@ journalctl -u alerts-tab-forwarder -n 100 --no-pager -o cat
 `/var/lib/prometheus/node-exporter/alerts_tab_forwarder.prom` (root, 0644).
 Пустые проходы не логируются; работа — один JSON-итог, сбои — ERROR без текста
 алертов и stderr. Версия в журнале — первые 12 символов SHA256 скрипта.
+Строки systemd о запуске каждую минуту отсекает `LogLevelMax=notice` юнита, живость — по пульсу,
+а не по журналу. Вывод скрипта идёт как notice, сбои юнита systemd пишет с notice и выше.
 Подробности установки и остановки — [docs/deploy.md](docs/deploy.md).
 
 ## Документация и проверки
