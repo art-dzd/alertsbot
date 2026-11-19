@@ -43,7 +43,9 @@ class Commands:
         self.ssh_codes: list[int] = []
         self.reset = False
         self.public_ok = True
-        self.telegram_route: dict[str, Any] | None = {"value": "1", "age_seconds": 10}
+        self.telegram_route: dict[str, Any] | None = {
+            "value": "1", "reachable": "1", "age_seconds": 10,
+        }
         self.now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
         self.tpanel_code = 0
         self.calls: list[list[str]] = []
@@ -309,6 +311,7 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
     route_file.write_text(
         '# TYPE telegram_route_up gauge\ntelegram_route_up{route="haproxy"} 1\n'
         'telegram_route_up{route="alertsbot"} 0\n'
+        'telegram_route_reachable{route="alertsbot"} 1\n'
     )
     real_open = open
 
@@ -330,7 +333,7 @@ def test_remote_query_reads_real_sqlite_in_id_order_with_limit(
     runpy.run_path(str(script), run_name="__main__")
     data = json.loads(capsys.readouterr().out)
     assert [row["id"] for row in data["rows"]] == list(range(3, 103))
-    assert tab_forwarder.telegram_route_up(data["telegram_route"]) is False
+    assert tab_forwarder.telegram_route_state(data["telegram_route"]) == "paused"
 
     monkeypatch.setattr(sys, "argv", [str(script), "init"])
     route_file.unlink()
@@ -460,3 +463,64 @@ def test_telegram_route_outage_reported_once_and_recovery(
     assert tab_forwarder.main() == 0
     assert "Telegram снова принимает алерты" in commands.messages[1]
     assert not (tmp_path / "telegram_outage").exists()
+
+
+TELEGRAM_PAUSED = {"value": "0", "reachable": "1", "age_seconds": 10}
+TELEGRAM_UP = {"value": "1", "reachable": "1", "age_seconds": 10}
+
+
+def test_short_telegram_pause_not_reported(
+    commands: Commands, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.telegram_route = TELEGRAM_PAUSED
+    assert tab_forwarder.main() == 0
+    assert json.loads(capsys.readouterr().out)["reason"] == "telegram_paused"
+    commands.now = commands.now.replace(minute=6)
+    assert tab_forwarder.main() == 0
+
+    commands.now = commands.now.replace(minute=7)
+    commands.telegram_route = TELEGRAM_UP
+    assert tab_forwarder.main() == 0
+    assert commands.messages == []
+    assert not (tmp_path / "telegram_outage").exists()
+
+
+def test_telegram_pause_reported_after_20_minutes(
+    commands: Commands, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.telegram_route = TELEGRAM_PAUSED
+    assert tab_forwarder.main() == 0
+    commands.now = commands.now.replace(minute=19)
+    assert tab_forwarder.main() == 0
+    assert commands.messages == []
+
+    commands.now = commands.now.replace(minute=20)
+    assert tab_forwarder.main() == 0
+    assert len(commands.messages) == 1
+    assert "Telegram не принимает запросы бота алертов" in commands.messages[0]
+    assert "14.10 15:00 МСК" in commands.messages[0]
+
+    commands.telegram_route = TELEGRAM_UP
+    assert tab_forwarder.main() == 0
+    assert "Telegram снова принимает алерты" in commands.messages[1]
+    capsys.readouterr()
+
+
+def test_proxy_failure_during_pause_reported_at_once(
+    commands: Commands, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    (tmp_path / "last_id").write_text("10\n")
+    commands.telegram_route = TELEGRAM_PAUSED
+    assert tab_forwarder.main() == 0
+    commands.now = commands.now.replace(minute=10)
+    assert tab_forwarder.main() == 0
+    assert commands.messages == []
+
+    commands.telegram_route = {"value": "0", "reachable": "0", "age_seconds": 10}
+    assert tab_forwarder.main() == 0
+    assert len(commands.messages) == 1
+    assert "не может отправить в Telegram" in commands.messages[0]
+    assert "14.10 15:00 МСК" in commands.messages[0]
+    capsys.readouterr()

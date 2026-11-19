@@ -13,7 +13,7 @@ import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 from uuid import uuid4
 
 BATCH_LIMIT = 100
@@ -31,9 +31,15 @@ TPANEL_TIMEOUT_SECONDS = 20
 # Этим путём шлют vpn, hr, gitea; его поломку при живом alertsbot иначе не видит никто.
 PUBLIC_READYZ = "https://aiomc.ru/alerts/readyz"
 OUTAGE_REPORT_AFTER = timedelta(minutes=3)
+# Как у TelegramProxyAllDown (infra 6e2233e): ночные паузы Telegram для бота 30.10–19.11 шли
+# 3–13 мин, недоставленное бот досылает сам.
+TELEGRAM_PAUSE_REPORT_AFTER = timedelta(minutes=20)
 # Монитор пишет маршрут раз в минуту; данные старше — его сбой, его ловит TelegramProxyMonitorStale.
 TELEGRAM_ROUTE_MAX_AGE_SECONDS = 300
 TELEGRAM_PROBLEM = "alertsbot не может отправить в Telegram — владелец алерты не получает"
+TELEGRAM_PAUSE_PROBLEM = (
+    "Telegram не принимает запросы бота алертов, прокси живы — владелец алерты не получает"
+)
 SSH_UNREACHABLE = 255
 ALERTSBOT_NOT_READY = 3
 # Сначала напрямую по tailnet, чтобы не зависеть от vpn; запасной путь — ProxyJump из ~/.ssh/config.
@@ -60,19 +66,31 @@ def parse_time(value: str) -> datetime:
     return parsed
 
 
-def telegram_route_up(route: object) -> bool | None:
-    """Маршрут alertsbot в Telegram по монитору на mts; None — данных нет или они устарели."""
+TelegramRoute = Literal["up", "down", "paused"]
+
+
+def telegram_route_state(route: object) -> TelegramRoute | None:
+    """Маршрут alertsbot в Telegram по монитору на mts; None — данных нет или они устарели.
+
+    paused — путь жив, Telegram не принимает запросы только бота: левый токен получил 401.
+    """
     if not isinstance(route, dict) or type(route.get("age_seconds")) is not int:
         return None
     if route["age_seconds"] > TELEGRAM_ROUTE_MAX_AGE_SECONDS:
         return None
     try:
-        return float(route["value"]) > 0
+        if float(route["value"]) > 0:
+            return "up"
     except (TypeError, ValueError):
         return None
+    try:
+        return "paused" if float(route["reachable"]) > 0 else "down"
+    except (KeyError, TypeError, ValueError):
+        # Хелпер истории до этой версии поля не отдаёт.
+        return "down"
 
 
-def fetch_history(last_id: int | None) -> tuple[int, list[Alert], bool, int, bool | None]:
+def fetch_history(last_id: int | None) -> tuple[int, list[Alert], bool, int, TelegramRoute | None]:
     """Возвращает max(id), новые строки, сброс id, номер ssh-маршрута и маршрут Telegram."""
     cursor = "init" if last_id is None else str(last_id)
     command = f"sudo -n -u alertsbot /usr/local/libexec/alertsbot-read-history {cursor}"
@@ -118,8 +136,8 @@ def fetch_history(last_id: int | None) -> tuple[int, list[Alert], bool, int, boo
             raise ValueError("invalid_history")
         parse_time(row["created_at"])
         previous = row["id"]
-    telegram_up = telegram_route_up(data.get("telegram_route"))
-    return data["max_id"], cast(list[Alert], rows), reset, route_index, telegram_up
+    telegram = telegram_route_state(data.get("telegram_route"))
+    return data["max_id"], cast(list[Alert], rows), reset, route_index, telegram
 
 
 def compact(value: str | None, limit: int) -> str:
@@ -204,11 +222,11 @@ def read_outage(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def note_outage(path: Path, problem: str) -> None:
-    """Сбой канала дольше OUTAGE_REPORT_AFTER — одно сообщение во вкладку."""
+def note_outage(path: Path, problem: str, report_after: timedelta = OUTAGE_REPORT_AFTER) -> None:
+    """Сбой канала дольше report_after — одно сообщение во вкладку."""
     now = datetime.now(timezone.utc)
     outage = read_outage(path) or {"since": now.isoformat(), "reported": False}
-    if not outage["reported"] and now - parse_time(outage["since"]) >= OUTAGE_REPORT_AFTER:
+    if not outage["reported"] and now - parse_time(outage["since"]) >= report_after:
         say(f"Канал алертов: {problem}. Сбой с {moscow_time(outage['since'])} МСК.")
         outage["reported"] = True
     write_atomic(path, json.dumps(outage))
@@ -273,7 +291,7 @@ def main() -> int:
         stage = "ssh"
         stage_started = time.monotonic()
         try:
-            maximum, rows, reset, route_index, telegram_up = fetch_history(last_id)
+            maximum, rows, reset, route_index, telegram = fetch_history(last_id)
         except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
             # Сбой сообщения о сбое пишется в итог с этапом outage, исходный — в его контекст.
             stage = "outage"
@@ -289,10 +307,13 @@ def main() -> int:
         else:
             end_outage(state_directory / "outage")
         # Без данных о маршруте сбой не открываем и не закрываем.
-        if telegram_up is False:
-            note_outage(state_directory / "telegram_outage", TELEGRAM_PROBLEM)
-        elif telegram_up:
-            end_outage(state_directory / "telegram_outage", "Telegram снова принимает алерты")
+        telegram_outage = state_directory / "telegram_outage"
+        if telegram == "paused":
+            note_outage(telegram_outage, TELEGRAM_PAUSE_PROBLEM, TELEGRAM_PAUSE_REPORT_AFTER)
+        elif telegram == "down":
+            note_outage(telegram_outage, TELEGRAM_PROBLEM)
+        elif telegram == "up":
+            end_outage(telegram_outage, "Telegram снова принимает алерты")
         if last_id is None:
             stage = "state"
             stage_started = time.monotonic()
@@ -314,8 +335,9 @@ def main() -> int:
             ["history_reset"] * reset
             + ["ssh_via_vpn"] * (route_index > 0)
             + ["public_unreachable"] * bool(problem)
-            + ["telegram_down"] * (telegram_up is False)
-            + ["telegram_route_unknown"] * (telegram_up is None)
+            + ["telegram_paused"] * (telegram == "paused")
+            + ["telegram_down"] * (telegram == "down")
+            + ["telegram_route_unknown"] * (telegram is None)
         )
         outcome = "fallback" if reasons else "ok"
         if reset:

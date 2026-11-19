@@ -12,19 +12,26 @@ from contextlib import closing
 # в Telegram. Его алерт идёт мимо истории, поэтому вкладка узнаёт о сбое отсюда.
 TELEGRAM_ROUTE_FILE = '/var/lib/node_exporter/textfile_collector/telegram_proxy.prom'
 TELEGRAM_ROUTE_METRIC = 'telegram_route_up{route="alertsbot"} '
+# 1 — Telegram через прокси отвечает левому токену: путь жив, не отвечает только боту.
+TELEGRAM_REACHABLE_METRIC = 'telegram_route_reachable{route="alertsbot"} '
 
 
 def telegram_route():
     try:
         with open(TELEGRAM_ROUTE_FILE, encoding='utf-8') as metrics:
             age = time.time() - os.fstat(metrics.fileno()).st_mtime
-            value = next(
-                (line.split()[-1] for line in metrics if line.startswith(TELEGRAM_ROUTE_METRIC)),
-                None,
-            )
+            lines = metrics.readlines()
     except OSError:
         return None
-    return {'value': value, 'age_seconds': round(age)}
+
+    def metric(name):
+        return next((line.split()[-1] for line in lines if line.startswith(name)), None)
+
+    return {
+        'value': metric(TELEGRAM_ROUTE_METRIC),
+        'reachable': metric(TELEGRAM_REACHABLE_METRIC),
+        'age_seconds': round(age),
+    }
 
 
 try:
